@@ -1,6 +1,7 @@
 package main
 
 import (
+	"crypto/tls"
 	"flag"
 	"fmt"
 	"io"
@@ -11,102 +12,106 @@ import (
 	"github.com/xtaci/smux"
 )
 
-// تنظیمات پیش‌فرض (قابل تغییر موقع اجرا)
 var (
-	tunnelPort = flag.String("l", ":8080", "Listen port for Upstream (e.g. :8080)")
-	userPort   = flag.String("u", ":1432", "Listen port for Users (e.g. :1432)")
-	fakeHost   = flag.String("h", "fast.com", "Fake HTTP Host header")
+	listenAddr = flag.String("l", ":443", "Tunnel Port")
+	userAddr   = flag.String("u", ":1432", "User Port")
+	mode       = flag.String("m", "httpmux", "Mode: httpmux/httpsmux")
+	profile    = flag.String("profile", "balanced", "Profile: balanced/aggressive/gaming")
+	certFile   = flag.String("cert", "", "Cert File")
+	keyFile    = flag.String("key", "", "Key File")
+	fakeHost   = flag.String("h", "www.google.com", "Fake Host")
 )
 
 var globalSession *smux.Session
 
 func main() {
 	flag.Parse()
-	fmt.Println("🔥 Bridge Core Started (Iran Server)")
-	fmt.Printf("   Wait for Upstream on: %s\n   Wait for Users on:    %s\n   Fake Host:            %s\n", *tunnelPort, *userPort, *fakeHost)
+	fmt.Printf("🔥 Bridge Core Running | Mode: %s | Profile: %s\n", *mode, *profile)
 
-	// ۱. گوش دادن به پورت تانل (منتظر سرور خارج)
-	go func() {
-		l, err := net.Listen("tcp", *tunnelPort)
-		if err != nil {
-			panic(err)
+	smuxConfig := getSmuxConfig(*profile)
+	var listener net.Listener
+	var err error
+
+	// انتخاب حالت (HTTP یا HTTPS)
+	if *mode == "httpsmux" {
+		if *certFile == "" || *keyFile == "" {
+			panic("❌ Cert/Key required for httpsmux")
 		}
+		cert, err := tls.LoadX509KeyPair(*certFile, *keyFile)
+		if err != nil { panic(err) }
+		listener, err = tls.Listen("tcp", *listenAddr, &tls.Config{Certificates: []tls.Certificate{cert}})
+	} else {
+		listener, err = net.Listen("tcp", *listenAddr)
+	}
+
+	if err != nil { panic(err) }
+
+	// مدیریت اتصال سرور خارج
+	go func() {
 		for {
-			conn, err := l.Accept()
-			if err != nil {
-				continue
-			}
-			go handleTunnelHandshake(conn)
+			conn, err := listener.Accept()
+			if err != nil { continue }
+			go handleHandshake(conn, smuxConfig)
 		}
 	}()
 
-	// ۲. گوش دادن به پورت کاربر (V2Ray Client)
-	l, err := net.Listen("tcp", *userPort)
-	if err != nil {
-		panic(err)
-	}
+	// مدیریت اتصال کاربر
+	userListener, err := net.Listen("tcp", *userAddr)
+	if err != nil { panic(err) }
 
 	for {
-		userConn, err := l.Accept()
-		if err != nil {
-			continue
-		}
-
-		// چک کنیم تانل وصله یا نه
+		uConn, err := userListener.Accept()
+		if err != nil { continue }
 		if globalSession == nil || globalSession.IsClosed() {
-			userConn.Close()
+			uConn.Close()
 			continue
 		}
-
-		// باز کردن یک استریم داخل تانل
 		stream, err := globalSession.OpenStream()
 		if err != nil {
-			userConn.Close()
+			uConn.Close()
 			continue
 		}
-
-		// وصل کردن کاربر به استریم
-		go pipe(userConn, stream)
+		go pipe(uConn, stream)
 	}
 }
 
-func handleTunnelHandshake(conn net.Conn) {
-	// خواندن درخواست HTTP فیک
+func handleHandshake(conn net.Conn, config *smux.Config) {
+	conn.SetDeadline(time.Now().Add(10 * time.Second))
 	buf := make([]byte, 1024)
-	conn.SetReadDeadline(time.Now().Add(5 * time.Second))
 	n, err := conn.Read(buf)
-	if err != nil {
-		conn.Close()
-		return
-	}
-	conn.SetReadDeadline(time.Time{})
-
-	req := string(buf[:n])
-	// بررسی اینکه آیا هدر Host درسته؟
-	if !strings.Contains(req, "Host: "+*fakeHost) {
-		fmt.Println("❌ Invalid Handshake. Closing connection.")
+	if err != nil { conn.Close(); return }
+	
+	if !strings.Contains(string(buf[:n]), *fakeHost) {
 		conn.Close()
 		return
 	}
 
-	// ارسال پاسخ 200 OK
-	resp := "HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\nConnection: keep-alive\r\n\r\n"
-	conn.Write([]byte(resp))
+	conn.Write([]byte("HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\n\r\n"))
+	conn.SetDeadline(time.Time{})
 
-	// ارتقا به SMUX (مولتی‌پلکس)
-	// اینجا ایران نقش Client رو داره چون آغازگر استریمه
-	sess, err := smux.Client(conn, smux.DefaultConfig())
-	if err != nil {
-		conn.Close()
-		return
-	}
+	sess, err := smux.Client(conn, config)
+	if err != nil { conn.Close(); return }
 	globalSession = sess
-	fmt.Println("✅ Upstream Connected via HTTPMux!")
+	fmt.Println("✅ Upstream Connected!")
+}
+
+func getSmuxConfig(p string) *smux.Config {
+	c := smux.DefaultConfig()
+	switch p {
+	case "aggressive":
+		c.KeepAliveInterval = 5 * time.Second
+		c.MaxReceiveBuffer = 16 * 1024 * 1024
+	case "gaming":
+		c.KeepAliveInterval = 1 * time.Second
+	default:
+		c.KeepAliveInterval = 10 * time.Second
+	}
+	return c
 }
 
 func pipe(a, b io.ReadWriteCloser) {
 	defer a.Close()
 	defer b.Close()
-	go io.Copy(a, b)
+	io.Copy(a, b)
 	io.Copy(b, a)
 }

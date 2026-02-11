@@ -1,4 +1,4 @@
-module github.com/amir6dev/MyTunnel
+module github.com/amir6dev/RsTunnel
 
 go 1.21
 
