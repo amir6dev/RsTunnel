@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # ====================================================
-#      RsTunnel v2.1 - Ultimate Manager
+#      RsTunnel v2.2 - Ultimate Manager
 #      Full Lifecycle: Install -> Manage -> Remove
 # ====================================================
 
@@ -13,7 +13,7 @@ CYAN='\033[0;36m'
 NC='\033[0m'
 
 BIN_DIR="/usr/local/bin"
-# 👇 آدرس ریپوزیتوری خودت رو چک کن
+# 👇 مطمئن شو آدرس گیت‌هابت درسته
 REPO_URL="https://github.com/amir6dev/RsTunnel.git"
 SERVICE_DIR="/etc/systemd/system"
 
@@ -92,6 +92,7 @@ install_server() {
     read -p "Select [1-3]: " P_OPT
     case $P_OPT in 2) PROF="aggressive";; 3) PROF="gaming";; *) PROF="balanced";; esac
 
+    CERT_FLAGS=""
     if [[ "$MODE" == "httpsmux" ]]; then
         generate_ssl
         CERT_FLAGS="-cert /etc/rstunnel/certs/cert.pem -key /etc/rstunnel/certs/key.pem"
@@ -206,3 +207,74 @@ manage_service() {
         echo "0) Back"
         echo ""
         read -p "Select: " OPT
+        case $OPT in
+            1) systemctl start $SVC; echo "✅ Started"; sleep 1;;
+            2) systemctl stop $SVC; echo "🛑 Stopped"; sleep 1;;
+            3) systemctl restart $SVC; echo "♻️ Restarted"; sleep 1;;
+            4) systemctl status $SVC --no-pager; read -p "Enter...";;
+            5) journalctl -u $SVC -f;;
+            0) return;;
+        esac
+    done
+}
+
+# --- Uninstall Logic ---
+
+uninstall_all() {
+    clear
+    echo -e "${RED}⚠️  DANGER ZONE: UNINSTALL ⚠️${NC}"
+    echo "This action will:"
+    echo "  1. Stop and Disable all RsTunnel services"
+    echo "  2. Remove Systemd service files"
+    echo "  3. Remove binaries ($BIN_DIR/rstunnel-*)"
+    echo "  4. Delete certificates and configurations"
+    echo ""
+    read -p "Are you sure you want to proceed? (y/N): " CONFIRM
+    
+    if [[ "$CONFIRM" != "y" && "$CONFIRM" != "Y" ]]; then
+        echo "Cancelled."
+        sleep 1
+        return
+    fi
+
+    echo -e "${YELLOW}Stopping services...${NC}"
+    systemctl stop rstunnel-bridge rstunnel-upstream 2>/dev/null
+    systemctl disable rstunnel-bridge rstunnel-upstream 2>/dev/null
+    
+    echo -e "${YELLOW}Removing files...${NC}"
+    rm -f $SERVICE_DIR/rstunnel-bridge.service
+    rm -f $SERVICE_DIR/rstunnel-upstream.service
+    rm -f $BIN_DIR/rstunnel-bridge
+    rm -f $BIN_DIR/rstunnel-upstream
+    rm -rf /etc/rstunnel
+    rm -f /etc/sysctl.d/99-rstunnel.conf
+    
+    systemctl daemon-reload
+    echo -e "${GREEN}✅ Uninstallation Complete! RsTunnel has been removed.${NC}"
+    read -p "Press Enter to continue..."
+}
+
+# --- Main Menu ---
+
+check_root
+while true; do
+    clear
+    echo -e "${CYAN}========================================${NC}"
+    echo -e "${CYAN}       RsTunnel v2.2 (Manager)          ${NC}"
+    echo -e "${CYAN}========================================${NC}"
+    echo "1) Install Server (Iran/Bridge)"
+    echo "2) Install Client (Kharej/Upstream)"
+    echo "3) Service Management (Logs/Restart)"
+    echo "4) Uninstall (Remove Everything)"
+    echo "0) Exit"
+    echo ""
+    read -p "Select Option: " OPT
+    case $OPT in
+        1) install_server ;;
+        2) install_client ;;
+        3) manage_service ;;
+        4) uninstall_all ;;
+        0) exit 0 ;;
+        *) echo "Invalid Option"; sleep 1 ;;
+    esac
+done
