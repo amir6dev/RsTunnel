@@ -8,7 +8,7 @@ import (
 
 type Config struct {
 	Mode           string `yaml:"mode"`   // server|client
-	Listen         string `yaml:"listen"` // server listen, e.g. 0.0.0.0:1010
+	Listen         string `yaml:"listen"` // server listen
 	ServerURL      string `yaml:"server_url"`
 	SessionID      string `yaml:"session_id"`
 	SessionTimeout int    `yaml:"session_timeout"`
@@ -18,7 +18,7 @@ type Config struct {
 	Obfs  ObfsConfig  `yaml:"obfs"`
 
 	Forward struct {
-		TCP []string `yaml:"tcp"` // e.g. ["1412->127.0.0.1:1412"] or ["0.0.0.0:443->127.0.0.1:22"]
+		TCP []string `yaml:"tcp"` // ["1412->127.0.0.1:1412"]
 		UDP []string `yaml:"udp"`
 	} `yaml:"forward"`
 }

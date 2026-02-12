@@ -1,251 +1,186 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# =========================
-# PicoTun Ultimate Installer
-# =========================
-REPO_DEFAULT="amir6dev/RsTunnel"
-BINARY_NAME="picotun"
-INSTALL_DIR="/usr/local/bin"
+REPO_URL="https://github.com/amir6dev/RsTunnel.git"
+BUILD_DIR="/tmp/picobuild"
+BIN_NAME="picotun"
+INSTALL_BIN="/usr/local/bin/${BIN_NAME}"
+
 CONFIG_DIR="/etc/picotun"
 CONFIG_FILE="${CONFIG_DIR}/config.yaml"
 SERVICE_FILE="/etc/systemd/system/picotun.service"
 
-# --- Colors ---
-NC='\033[0m'
-RED='\033[1;31m'
-GREEN='\033[1;32m'
-YELLOW='\033[1;33m'
-BLUE='\033[1;34m'
-CYAN='\033[1;36m'
+GO_VERSION="1.21.13"   # می‌تونی عوضش کنی
 
-# --- Helper Functions (تعریف شده در بالا برای جلوگیری از ارور) ---
-print_header() {
-    clear
-    echo -e "${CYAN}===============================================${NC}"
-    echo -e "${GREEN}      🚀 PicoTun Tunnel Manager (Auto)     ${NC}"
-    echo -e "${CYAN}===============================================${NC}"
-    echo ""
-}
-
-print_msg() { echo -e "${BLUE}➤ $1${NC}"; }
-print_ok() { echo -e "${GREEN}✔ $1${NC}"; }
-print_err() { echo -e "${RED}✖ $1${NC}"; }
+say() { echo "➤ $*"; }
 
 need_root() {
-    if [[ "${EUID}" -ne 0 ]]; then
-        print_err "Run as root!"
-        exit 1
-    fi
+  if [[ "${EUID}" -ne 0 ]]; then
+    echo "Run as root: sudo bash setup.sh"
+    exit 1
+  fi
 }
 
-# --- 1. Force Install Go ---
-install_go() {
-    print_msg "Checking Go version..."
-    
-    force_install() {
-        echo -e "${YELLOW}⬇️  Installing Go 1.22 (Force Update)...${NC}"
-        rm -rf /usr/local/go
-        rm -f /usr/bin/go
-        
-        wget -q https://go.dev/dl/go1.22.0.linux-amd64.tar.gz -O go.tar.gz
-        tar -C /usr/local -xzf go.tar.gz
-        rm go.tar.gz
-        
-        ln -sf /usr/local/go/bin/go /usr/bin/go
-        export PATH=$PATH:/usr/local/go/bin
-    }
-
-    if ! command -v go &> /dev/null; then
-        force_install
-    else
-        VER=$(go version | awk '{print $3}' | tr -d "go")
-        if [[ "$VER" != 1.2* ]]; then
-            force_install
-        else
-            print_ok "Go version is OK: $VER"
-        fi
-    fi
+detect_arch() {
+  local arch
+  arch="$(uname -m)"
+  case "$arch" in
+    x86_64) echo "amd64" ;;
+    aarch64|arm64) echo "arm64" ;;
+    *)
+      echo "Unsupported arch: $arch"
+      exit 1
+      ;;
+  esac
 }
 
-# --- 2. Build Core ---
-install_core() {
-    install_go
-    
-    print_msg "Cloning source code..."
-    rm -rf /tmp/picobuild
-    git clone "https://github.com/${REPO_DEFAULT}.git" /tmp/picobuild
-    cd /tmp/picobuild || exit
-    
-    # ورود به پوشه پروژه اگر در ساب‌فولدر باشد
-    if [ -d "PicoTun" ]; then cd PicoTun; fi
-
-    print_msg "Fixing dependencies..."
-    # حذف فایل‌های مزاحم قبلی برای بیلد تمیز
-    rm -f go.mod go.sum
-    
-    # ساخت مجدد ماژول برای جلوگیری از ارور مسیر
-    go mod init github.com/amir6dev/rstunnel
-    go mod tidy
-    
-    # پیدا کردن مسیر main.go
-    TARGET=""
-    if [ -f "cmd/picotun/main.go" ]; then TARGET="cmd/picotun/main.go"; fi
-    if [ -f "main.go" ]; then TARGET="main.go"; fi
-    
-    if [ -z "$TARGET" ]; then
-        print_err "Could not find main.go!"
-        ls -R
-        exit 1
-    fi
-
-    print_msg "Building Binary..."
-    CGO_ENABLED=0 go build -o picotun "$TARGET"
-    
-    if [ -f "picotun" ]; then
-        mv picotun "$INSTALL_DIR/$BINARY_NAME"
-        chmod +x "$INSTALL_DIR/$BINARY_NAME"
-        rm -rf /tmp/picobuild
-        print_ok "Installed successfully!"
-    else
-        print_err "Build failed!"
-        exit 1
-    fi
+ensure_deps() {
+  say "Checking environment..."
+  apt-get update -y >/dev/null
+  apt-get install -y curl git ca-certificates tar >/dev/null
 }
 
-# --- Configuration Wizard ---
-configure_wizard() {
-    MODE=$1
-    mkdir -p "$CONFIG_DIR"
-    
-    echo ""
-    read -p "Tunnel Port [1010]: " PORT; PORT=${PORT:-1010}
-    read -p "PSK (Password): " PSK
-    if [[ -z "$PSK" ]]; then PSK=$(openssl rand -hex 16); echo "Generated: $PSK"; fi
-    
-    if [[ "$MODE" == "server" ]]; then
-        TCP_MAPS=""
-        echo -e "${YELLOW}Port Forwarding (Reverse Tunnel):${NC}"
-        while true; do
-            read -p "Add Map? (y/N): " yn
-            [[ ! "$yn" =~ ^[Yy] ]] && break
-            read -p "  Bind Port (e.g. 2080): " bp
-            read -p "  Target (e.g. 127.0.0.1:80): " tg
-            TCP_MAPS+="    - \"0.0.0.0:${bp}->${tg}\"\n"
-        done
-        
-        cat > "$CONFIG_FILE" <<EOF
+install_go_121() {
+  if command -v go >/dev/null 2>&1; then
+    local gv
+    gv="$(go version || true)"
+    if echo "$gv" | grep -q "go1.21"; then
+      return
+    fi
+  fi
+
+  say "Installing Go ${GO_VERSION}..."
+  local arch
+  arch="$(detect_arch)"
+
+  local url="https://go.dev/dl/go${GO_VERSION}.linux-${arch}.tar.gz"
+  rm -rf /usr/local/go
+  curl -fL "$url" -o /tmp/go.tgz >/dev/null
+  tar -C /usr/local -xzf /tmp/go.tgz
+  rm -f /tmp/go.tgz
+
+  # make go available for this script
+  export PATH="/usr/local/go/bin:${PATH}"
+}
+
+clone_repo() {
+  say "Cloning source code..."
+  rm -rf "$BUILD_DIR"
+  git clone --depth 1 "$REPO_URL" "$BUILD_DIR" >/dev/null
+}
+
+build_binary() {
+  say "Building ${BIN_NAME}..."
+
+  export PATH="/usr/local/go/bin:${PATH}"
+
+  # Fix blocked proxy issues
+  export GOPROXY=direct
+  export GOSUMDB=off
+
+  cd "${BUILD_DIR}/PicoTun"
+
+  say "Resolving dependencies (go mod tidy)..."
+  /usr/local/go/bin/go mod tidy
+
+  say "Compiling..."
+  CGO_ENABLED=0 /usr/local/go/bin/go build -o "${BUILD_DIR}/${BIN_NAME}" ./cmd/picotun
+}
+
+install_binary() {
+  install -m 0755 "${BUILD_DIR}/${BIN_NAME}" "${INSTALL_BIN}"
+  say "Installed: ${INSTALL_BIN}"
+}
+
+write_default_config_if_missing() {
+  mkdir -p "${CONFIG_DIR}"
+
+  if [[ -f "${CONFIG_FILE}" ]]; then
+    return
+  fi
+
+  cat > "${CONFIG_FILE}" <<'YAML'
 mode: server
-listen: "0.0.0.0:${PORT}"
+listen: "0.0.0.0:1010"
 session_timeout: 15
-psk: "${PSK}"
+psk: ""
+
 mimic:
-  fake_domain: "www.google.com"
+  fake_domain: ""
+  fake_path: ""
+  user_agent: "Mozilla/5.0"
+  custom_headers: []
   session_cookie: true
+
 obfs:
   enabled: true
-  min_padding: 16
-  max_padding: 256
+  min_padding: 8
+  max_padding: 64
+  min_delay: 0
+  max_delay: 25
+  burst_chance: 0
+
 forward:
   tcp:
-${TCP_MAPS}
-EOF
-    else
-        read -p "Server IP: " SIP
-        cat > "$CONFIG_FILE" <<EOF
-mode: client
-server_url: "http://${SIP}:${PORT}/tunnel"
-session_id: "sess-$(date +%s)"
-psk: "${PSK}"
-mimic:
-  fake_domain: "www.google.com"
-  session_cookie: true
-obfs:
-  enabled: true
-  min_padding: 16
-  max_padding: 256
-forward:
-  tcp: []
-EOF
-    fi
-    install_service
+    - "1412->127.0.0.1:1412"
+  udp: []
+YAML
+
+  say "Created default config: ${CONFIG_FILE}"
 }
 
-install_service() {
-    cat > "$SERVICE_FILE" <<EOF
+write_service() {
+  cat > "${SERVICE_FILE}" <<EOF
 [Unit]
 Description=PicoTun Service
 After=network.target
 
 [Service]
 Type=simple
-ExecStart=$INSTALL_DIR/$BINARY_NAME -config $CONFIG_FILE
+ExecStart=${INSTALL_BIN} -config ${CONFIG_FILE}
 Restart=always
-RestartSec=3
-LimitNOFILE=1048576
+RestartSec=2
 
 [Install]
 WantedBy=multi-user.target
 EOF
-    systemctl daemon-reload
-    systemctl enable picotun >/dev/null 2>&1
-    systemctl restart picotun
-    print_ok "Service Started!"
+
+  systemctl daemon-reload
+  systemctl enable --now picotun >/dev/null
+  say "Service installed and started."
 }
 
-manage_menu() {
-    while true; do
-        echo -e "\n${YELLOW}:: Service Management ::${NC}"
-        echo "1) Start"
-        echo "2) Stop"
-        echo "3) Restart"
-        echo "4) Logs"
-        echo "5) Uninstall"
-        echo "0) Back"
-        read -p "Select: " opt
-        case $opt in
-            1) systemctl start picotun; print_ok "Started" ;;
-            2) systemctl stop picotun; print_ok "Stopped" ;;
-            3) systemctl restart picotun; print_ok "Restarted" ;;
-            4) journalctl -u picotun -f ;;
-            5) uninstall_all; return ;;
-            0) return ;;
-        esac
-    done
+menu() {
+  echo ""
+  echo "1) Install/Update (build from source + systemd)"
+  echo "2) Show service status"
+  echo "3) Show logs"
+  echo "4) Restart service"
+  echo "5) Exit"
+  echo ""
+  read -r -p "Select: " choice
+
+  case "${choice:-}" in
+    1)
+      ensure_deps
+      install_go_121
+      clone_repo
+      build_binary
+      install_binary
+      write_default_config_if_missing
+      write_service
+      echo ""
+      systemctl status picotun --no-pager || true
+      ;;
+    2) systemctl status picotun --no-pager || true ;;
+    3) journalctl -u picotun -n 200 --no-pager || true ;;
+    4) systemctl restart picotun || true; systemctl status picotun --no-pager || true ;;
+    5) exit 0 ;;
+    *) echo "Invalid choice" ;;
+  esac
 }
 
-uninstall_all() {
-    print_msg "Uninstalling..."
-    systemctl stop picotun >/dev/null 2>&1 || true
-    systemctl disable picotun >/dev/null 2>&1 || true
-    rm -f "$SERVICE_FILE" "$INSTALL_DIR/$BINARY_NAME"
-    rm -rf "$CONFIG_DIR"
-    systemctl daemon-reload
-    print_ok "Uninstalled."
-}
-
-# --- Main Menu ---
-main_menu() {
-    need_root
-    while true; do
-        print_header
-        echo "1) Install / Update Core (Auto-Fix)"
-        echo "2) Configure Server"
-        echo "3) Configure Client"
-        echo "4) Manage Service"
-        echo "5) Uninstall"
-        echo "0) Exit"
-        echo ""
-        read -p "Select: " opt
-        case $opt in
-            1) install_core; read -p "Press Enter..." ;;
-            2) configure_wizard "server" ;;
-            3) configure_wizard "client" ;;
-            4) manage_menu ;;
-            5) uninstall_all ;;
-            0) exit ;;
-        esac
-    done
-}
-
-main_menu
+need_root
+while true; do
+  menu
+done

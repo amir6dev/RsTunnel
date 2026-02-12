@@ -4,56 +4,64 @@ import (
 	"flag"
 	"log"
 	"net/http"
-	
-	// ✅ مسیر صحیح پکیج
-	"github.com/amir6dev/rstunnel/PicoTun"
+	"time"
+
+	httpmux "github.com/amir6dev/RsTunnel/PicoTun"
 )
 
 func main() {
-	configPath := flag.String("config", "/etc/picotun/config.yaml", "Path to config")
+	configPath := flag.String("config", "/etc/picotun/config.yaml", "path to config file")
 	flag.Parse()
 
-	// چون نام پکیج داخل فایل‌های PicoTun "httpmux" است، باید با httpmux صدا بزنیم
 	cfg, err := httpmux.LoadConfig(*configPath)
-	if err != nil { log.Fatalf("Config error: %v", err) }
-	
-	if cfg.Mode == "server" {
-		runServer(cfg)
-	} else {
-		runClient(cfg)
+	if err != nil {
+		log.Fatalf("load config: %v", err)
 	}
-}
 
-func runServer(cfg *httpmux.Config) {
-	if cfg.Listen == "" { cfg.Listen = "0.0.0.0:1010" }
-	
-	// سرور با تایم‌اوت طولانی‌تر برای هماهنگی با Long-Polling
-	srv := httpmux.NewServer(cfg.SessionTimeout, &cfg.Mimic, &cfg.Obfs, cfg.PSK)
-
-	if cfg.Forward != nil {
-		for _, m := range cfg.Forward.TCP {
-			bind, target, ok := splitMap(m)
-			if ok { go srv.StartReverseTCP(bind, target) }
+	switch cfg.Mode {
+	case "server":
+		if cfg.Listen == "" {
+			cfg.Listen = "0.0.0.0:1010"
 		}
+		if cfg.SessionTimeout <= 0 {
+			cfg.SessionTimeout = 15
+		}
+
+		srv := httpmux.NewServer(cfg.SessionTimeout, &cfg.Mimic, &cfg.Obfs, cfg.PSK)
+
+		// Reverse TCP listeners from config
+		for _, m := range cfg.Forward.TCP {
+			bind, target, ok := httpmux.SplitMap(m)
+			if !ok {
+				log.Printf("invalid tcp map: %q", m)
+				continue
+			}
+			go srv.StartReverseTCP(bind, target)
+		}
+
+		mux := http.NewServeMux()
+		mux.HandleFunc("/tunnel", srv.HandleHTTP)
+
+		log.Printf("server running on %s (endpoint /tunnel)", cfg.Listen)
+		log.Fatal(http.ListenAndServe(cfg.Listen, mux))
+
+	case "client":
+		if cfg.ServerURL == "" {
+			log.Fatal("server_url is required in client config")
+		}
+		if cfg.SessionID == "" {
+			cfg.SessionID = "sess-" + time.Now().Format("20060102150405")
+		}
+
+		cl := httpmux.NewClient(cfg.ServerURL, cfg.SessionID, &cfg.Mimic, &cfg.Obfs, cfg.PSK)
+
+		rev := httpmux.NewClientReverse(cl.Transport)
+		go rev.Run()
+
+		log.Printf("client running. server_url=%s session_id=%s", cfg.ServerURL, cfg.SessionID)
+		select {}
+
+	default:
+		log.Fatalf("invalid mode: %q (expected server|client)", cfg.Mode)
 	}
-
-	http.HandleFunc("/tunnel", srv.HandleHTTP)
-	log.Printf("🔥 Server running on %s (Long-Polling Active)", cfg.Listen)
-	log.Fatal(http.ListenAndServe(cfg.Listen, nil))
-}
-
-func runClient(cfg *httpmux.Config) {
-	cl := httpmux.NewClient(cfg.ServerURL, cfg.SessionID, &cfg.Mimic, &cfg.Obfs, cfg.PSK)
-	rev := httpmux.NewClientReverse(cl.Transport)
-	
-	log.Printf("🚀 Client connected to %s", cfg.ServerURL)
-	rev.Run()
-}
-
-func splitMap(s string) (string, string, bool) {
-	parts := strings.Split(s, "->")
-	if len(parts) != 2 { return "", "", false }
-	bind := strings.TrimSpace(parts[0])
-	if !strings.Contains(bind, ":") { bind = "0.0.0.0:" + bind }
-	return bind, strings.TrimSpace(parts[1]), true
 }
