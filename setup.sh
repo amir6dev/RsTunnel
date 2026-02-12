@@ -5,7 +5,7 @@ set -euo pipefail
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'; CYAN='\033[0;36m'; NC='\033[0m'
 say() { echo -e "${CYAN}➤${NC} $*"; }
 ok()  { echo -e "${GREEN}✓${NC} $*"; }
-warn(){ echo -e "${YELLOW}⚠${NC} $*"; }
+warn() { echo -e "${YELLOW}⚠${NC} $*"; }
 die() { echo -e "${RED}✖${NC} $*"; exit 1; }
 
 # ========= Project =========
@@ -15,21 +15,29 @@ APP="picotun"
 
 INSTALL_DIR="/usr/local/bin"
 BIN_PATH="${INSTALL_DIR}/${APP}"
-
 CONFIG_DIR="/etc/picotun"
 SERVER_CFG="${CONFIG_DIR}/server.yaml"
 CLIENT_CFG="${CONFIG_DIR}/client.yaml"
-
 SYSTEMD_DIR="/etc/systemd/system"
 SERVER_SVC="picotun-server"
 CLIENT_SVC="picotun-client"
 BUILD_DIR="/tmp/picobuild"
+HOME_DIR="$HOME"
 
 # ========= Helpers =========
-need_root(){ [[ ${EUID} -eq 0 ]] || die "Run as root (sudo)."; }
+need_root() { [[ ${EUID} -eq 0 ]] || die "Run as root (sudo)."; }
 
-ensure_deps(){
-  say "Checking environment..."
+banner() {
+  clear
+  echo -e "${GREEN}*** RsTunnel / PicoTun Ultimate ***${NC}"
+  echo -e "Repo: https://github.com/${OWNER}/${REPO}"
+  echo -e "================================="
+  echo ""
+}
+
+# ========= Environment Prep =========
+ensure_deps() {
+  say "Checking system dependencies..."
   if command -v apt >/dev/null 2>&1; then
     apt-get update -y >/dev/null
     apt-get install -y curl ca-certificates tar git >/dev/null
@@ -38,18 +46,11 @@ ensure_deps(){
   else
     die "No supported package manager. Install curl+tar+git manually."
   fi
-  ok "Dependencies installed"
+  ok "Dependencies installed."
 }
 
-banner(){
-  echo -e "${GREEN}*** RsTunnel / PicoTun Ultimate ***${NC}"
-  echo -e "Repo: https://github.com/${OWNER}/${REPO}"
-  echo -e "================================="
-  echo ""
-}
-
-# ========= Go Installation (Iran Optimized) =========
-install_go(){
+install_go() {
+  # تنظیمات پروکسی ایران
   export GOPROXY=https://goproxy.cn,direct
   export GOTOOLCHAIN=local
   export GOSUMDB=off
@@ -61,7 +62,7 @@ install_go(){
   fi
   
   local GO_VER="1.22.1"
-  say "Installing Go ${GO_VER} (Mirror)..."
+  say "Installing Go ${GO_VER} (Aliyun Mirror)..."
   local url="https://mirrors.aliyun.com/golang/go${GO_VER}.linux-amd64.tar.gz"
   
   rm -rf /usr/local/go
@@ -75,10 +76,15 @@ install_go(){
   ok "Go installed."
 }
 
-# ========= Build Core (Fix Imports) =========
+prepare_env() {
+    ensure_deps
+    install_go
+}
+
+# ========= Build Core =========
 update_core() {
-  ensure_deps
-  install_go
+  # اطمینان از اینکه در مسیر درستی هستیم
+  cd "$HOME_DIR"
   
   export PATH="/usr/local/go/bin:${PATH}"
   export GOPROXY=https://goproxy.cn,direct
@@ -88,27 +94,21 @@ update_core() {
   say "Cloning source code..."
   rm -rf "$BUILD_DIR"
   git clone --depth 1 "https://github.com/${OWNER}/${REPO}.git" "$BUILD_DIR" >/dev/null
+  
+  # ورود به پوشه بیلد
   cd "$BUILD_DIR"
 
-  say "Fixing module & imports..."
-  # 1. حذف فایل‌های ماژول قدیمی
+  say "Fixing imports & dependencies..."
   rm -f go.mod go.sum
 
-  # 2. ایجاد ماژول جدید با حروف کوچک (استاندارد)
+  # 1. ساخت ماژول
   go mod init github.com/amir6dev/rstunnel
 
-  # 3. اصلاح مسیرهای ایمپورت در فایل‌های برنامه
-  # مشکل ارور شما این بود که کدها دنبال پوشه PicoTun می‌گشتند ولی فایل‌ها در روت بودند.
-  # این دستورات، آدرس‌های اشتباه را به آدرس ریشه تغییر می‌دهند.
-  
-  # تغییر github.com/amir6dev/RsTunnel/PicoTun -> github.com/amir6dev/rstunnel
+  # 2. اصلاح مسیرهای ایمپورت (چون فایل‌ها در روت هستند اما کد انتظار پوشه PicoTun دارد)
   find . -name "*.go" -type f -exec sed -i 's|github.com/amir6dev/RsTunnel/PicoTun|github.com/amir6dev/rstunnel|g' {} +
-  
-  # تغییر github.com/amir6dev/RsTunnel -> github.com/amir6dev/rstunnel (برای اطمینان)
   find . -name "*.go" -type f -exec sed -i 's|github.com/amir6dev/RsTunnel|github.com/amir6dev/rstunnel|g' {} +
   
-  say "Pinning dependencies..."
-  # دانلود نسخه‌های سازگار با Go 1.22
+  # 3. دانلود نسخه‌های پین شده (سازگار با Go 1.22)
   go get golang.org/x/net@v0.23.0
   go get github.com/refraction-networking/utls@v1.6.0
   go get github.com/xtaci/smux@v1.5.24
@@ -117,15 +117,24 @@ update_core() {
   go mod tidy
   
   say "Building binary..."
-  # بیلد کردن از پوشه cmd/picotun
-  CGO_ENABLED=0 go build -o picotun ./cmd/picotun
+  local TARGET=""
+  if [[ -f "cmd/picotun/main.go" ]]; then TARGET="cmd/picotun/main.go"; fi
+  if [[ -f "main.go" ]]; then TARGET="main.go"; fi
+  
+  if [[ -z "$TARGET" ]]; then die "Could not find main.go"; fi
+  
+  CGO_ENABLED=0 go build -o picotun "$TARGET"
   
   if [[ ! -f "picotun" ]]; then
-      die "Build failed! Check logs above."
+      die "Build failed!"
   fi
   
   install -m 0755 picotun "${BIN_PATH}"
   ok "Installed binary: ${BIN_PATH}"
+
+  # رفع باگ: بازگشت به خانه قبل از حذف پوشه موقت
+  cd "$HOME_DIR"
+  rm -rf "$BUILD_DIR"
 }
 
 # ========= Config & Service =========
@@ -212,8 +221,9 @@ enable_start_service(){
 
 # ========= Menus =========
 install_server(){
-  banner
-  update_core
+  # اگر فایل باینری نیست، اول بساز
+  if [[ ! -f "${BIN_PATH}" ]]; then update_core; fi
+  
   write_default_server_config_if_missing
   create_service "server"
   enable_start_service "${SERVER_SVC}"
@@ -222,8 +232,8 @@ install_server(){
 }
 
 install_client(){
-  banner
-  update_core
+  if [[ ! -f "${BIN_PATH}" ]]; then update_core; fi
+  
   write_default_client_config_if_missing
   create_service "client"
   enable_start_service "${CLIENT_SVC}"
@@ -300,9 +310,9 @@ main_menu(){
     banner
     echo "  1) Install Server"
     echo "  2) Install Client"
-    echo "  3) Settings"
+    echo "  3) Settings (Manage Services)"
     echo "  4) Show Logs"
-    echo "  5) Update Core"
+    echo "  5) Install / Update Core"
     echo "  6) Uninstall"
     echo "  0) Exit"
     read -r -p "Select: " c
@@ -311,12 +321,15 @@ main_menu(){
       2) install_client ;;
       3) settings_menu ;;
       4) show_logs_picker ;;
-      5) update_core; ok "Done"; sleep 1 ;;
+      5) update_core; ok "Done"; sleep 2 ;;
       6) uninstall_all ;;
       0) exit 0 ;;
     esac
   done
 }
 
+# --- Start ---
 need_root
+# نصب پیش‌نیازها قبل از نمایش منو
+prepare_env
 main_menu
