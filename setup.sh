@@ -33,7 +33,7 @@ die() { echo -e "${RED}✖${NC} $*"; exit 1; }
 
 show_banner() {
   echo -e "${CYAN}"
-  echo -e "${GREEN}***  RsTunnel / PicoTun  ***${NC}"
+  echo -e "${GREEN}*** RsTunnel / PicoTun  ***${NC}"
   echo -e "${CYAN}Repo: ${NC}${REPO_URL}"
   echo -e "${CYAN}=================================${NC}"
   echo ""
@@ -68,17 +68,17 @@ detect_arch() {
   esac
 }
 
-install_go_121() {
-  # Dagger script installs deps only; for your build-from-source we must ensure Go is new enough.
-  # You can change version if needed.
-  local GO_VERSION="1.21.13"
+install_go_new() {
+  # Updated to Go 1.22.5 to avoid 404 errors with older versions
+  local GO_VERSION="1.22.5"
 
   if command -v go >/dev/null 2>&1; then
-    if go version | grep -q "go1.21"; then
+    # Check if version is recent enough (1.21+)
+    if go version | grep -E "go1\.(2[1-9]|[3-9][0-9])"; then
       ok "Go already installed: $(go version)"
       return
     fi
-    warn "Go exists but not 1.21.x: $(go version)"
+    warn "Go exists but is old: $(go version)"
   fi
 
   say "Installing Go ${GO_VERSION}..."
@@ -87,11 +87,21 @@ install_go_121() {
   url="https://go.dev/dl/go${GO_VERSION}.linux-${arch}.tar.gz"
 
   rm -rf /usr/local/go
-  curl -fsSL "$url" -o /tmp/go.tgz
+  # Added -L to follow redirects if needed
+  if ! curl -fsSL "$url" -o /tmp/go.tgz; then
+     die "Failed to download Go from $url. Check internet connection."
+  fi
+  
   tar -C /usr/local -xzf /tmp/go.tgz
   rm -f /tmp/go.tgz
 
   export PATH="/usr/local/go/bin:${PATH}"
+  
+  # Verify installation
+  if ! /usr/local/go/bin/go version >/dev/null 2>&1; then
+     die "Go installation failed."
+  fi
+  
   ok "Go installed: $(/usr/local/go/bin/go version)"
 }
 
@@ -109,9 +119,7 @@ build_binary() {
   export GOPROXY=direct
   export GOSUMDB=off
 
-  # IMPORTANT:
-  # Adjust this path if your Go module lives in a subfolder.
-  # From earlier structure, your module is inside PicoTun/, so we build there.
+  # Adjust build path based on repo structure
   if [[ -d "${BUILD_DIR}/PicoTun" ]]; then
     cd "${BUILD_DIR}/PicoTun"
     /usr/local/go/bin/go mod tidy
@@ -120,6 +128,10 @@ build_binary() {
     cd "${BUILD_DIR}"
     /usr/local/go/bin/go mod tidy
     CGO_ENABLED=0 /usr/local/go/bin/go build -o "${BUILD_DIR}/${APP_NAME}" ./cmd/picotun
+  fi
+
+  if [[ ! -f "${BUILD_DIR}/${APP_NAME}" ]]; then
+      die "Build failed! Binary not found."
   fi
 
   ok "Build done: ${BUILD_DIR}/${APP_NAME}"
@@ -147,7 +159,6 @@ mode: "server"
 listen: "0.0.0.0:1010"
 psk: ""
 
-# only keep what your core supports
 mimic:
   fake_domain: ""
   fake_path: ""
@@ -245,7 +256,7 @@ EOF
 install_server_flow() {
   show_banner
   install_deps
-  install_go_121
+  install_go_new
   clone_repo
   build_binary
   install_binary
@@ -263,7 +274,7 @@ install_server_flow() {
 install_client_flow() {
   show_banner
   install_deps
-  install_go_121
+  install_go_new
   clone_repo
   build_binary
   install_binary
