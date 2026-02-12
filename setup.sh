@@ -19,17 +19,27 @@ YELLOW='\033[1;33m'
 BLUE='\033[1;34m'
 CYAN='\033[1;36m'
 
+# --- Helper Functions ---
+print_header() {
+    clear
+    echo -e "${CYAN}===============================================${NC}"
+    echo -e "${GREEN}      🚀 PicoTun Tunnel Manager (Pro)      ${NC}"
+    echo -e "${CYAN}===============================================${NC}"
+    echo ""
+}
+
 print_msg() { echo -e "${BLUE}➤ $1${NC}"; }
 print_ok() { echo -e "${GREEN}✔ $1${NC}"; }
 print_err() { echo -e "${RED}✖ $1${NC}"; }
 
 need_root() {
     if [[ "${EUID}" -ne 0 ]]; then
-        print_err "Please run as root!"
+        print_err "Run as root!"
         exit 1
     fi
 }
 
+# --- Core Logic ---
 install_core() {
     print_msg "Checking environment..."
     apt-get update -qq >/dev/null
@@ -38,26 +48,18 @@ install_core() {
     print_msg "Cloning source code..."
     rm -rf /tmp/picobuild
     git clone "https://github.com/${REPO_DEFAULT}.git" /tmp/picobuild
-    
-    if [ ! -d "/tmp/picobuild" ]; then
-        print_err "Failed to clone repository!"
-        exit 1
-    fi
-
     cd /tmp/picobuild || exit
-
-    # اگر فایل‌ها داخل پوشه PicoTun هستند، وارد شو
-    if [ -d "PicoTun" ]; then cd PicoTun; fi
-
-    # حل وابستگی‌ها
+    
+    # حل مشکل وابستگی‌ها
     if [ -f "go.mod" ]; then
         print_msg "Resolving dependencies (go mod tidy)..."
         go mod tidy
     fi
-
-    # پیدا کردن مسیر فایل اصلی
+    
+    # پیدا کردن مسیر فایل اصلی برای بیلد
     TARGET=""
     if [ -f "cmd/picotun/main.go" ]; then TARGET="cmd/picotun/main.go"; fi
+    if [ -f "PicoTun/cmd/picotun/main.go" ]; then TARGET="PicoTun/cmd/picotun/main.go"; fi
     if [ -f "main.go" ]; then TARGET="main.go"; fi
     
     if [ -z "$TARGET" ]; then
@@ -161,13 +163,15 @@ EOF
 
 manage_menu() {
     while true; do
-        echo -e "\n${YELLOW}:: Service Management ::${NC}"
+        print_header
+        echo -e "${YELLOW}:: Service Management ::${NC}"
         echo "1) Start"
         echo "2) Stop"
         echo "3) Restart"
         echo "4) Logs"
         echo "5) Uninstall"
         echo "0) Back"
+        echo ""
         read -p "Select: " opt
         case $opt in
             1) systemctl start picotun; print_ok "Started" ;;
@@ -191,7 +195,6 @@ uninstall_all() {
 }
 
 main_menu() {
-    need_root
     while true; do
         print_header
         echo "1) Install / Update Core"
@@ -213,4 +216,5 @@ main_menu() {
     done
 }
 
+need_root
 main_menu
