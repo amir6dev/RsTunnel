@@ -10,8 +10,8 @@ type ObfsConfig struct {
 	Enabled     bool `yaml:"enabled"`
 	MinPadding  int  `yaml:"min_padding"`
 	MaxPadding  int  `yaml:"max_padding"`
-	MinDelayMS  int  `yaml:"min_delay"`
-	MaxDelayMS  int  `yaml:"max_delay"`
+	MinDelayMS  int  `yaml:"min_delay_ms"`
+	MaxDelayMS  int  `yaml:"max_delay_ms"`
 	BurstChance int  `yaml:"burst_chance"`
 }
 

@@ -5,8 +5,7 @@ import (
 	"log"
 	"net/http"
 	"strings"
-
-	"rstunnel/httpmux"
+    httpmux "github.com/amir6dev/rstunnel/PicoTun"
 )
 
 func main() {

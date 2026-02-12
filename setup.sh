@@ -1,281 +1,488 @@
-#!/bin/bash
+#!/usr/bin/env bash
+set -euo pipefail
 
 # ============================================================================
 #  RsTunnel Manager (Dagger-Style Automation)
-#  Fixed & Optimized for Iran Servers
+#  - Prefers prebuilt binary (no Go needed) ✅ (Iran-friendly)
+#  - Falls back to building from source if needed
+#  - Dependency detection (no reinstall if already present)
+#  - Systemd services + YAML configs (Dagger-like prompts)
 # ============================================================================
+# Version: 1.3.0
 
-# Colors
-RED='\033[0;31m'
-GREEN='\033[0;32m'
-YELLOW='\033[1;33m'
-BLUE='\033[0;34m'
-PURPLE='\033[0;35m'
-CYAN='\033[0;36m'
-NC='\033[0m'
+APP_NAME="RsTunnel"
+BIN_NAME="picotun"
+REPO_OWNER="amir6dev"
+REPO_NAME="RsTunnel"
+REPO_BRANCH_DEFAULT="main"
 
-# Paths
-REPO_URL="https://github.com/amir6dev/RsTunnel.git"
-APP_NAME="picotun"
-INSTALL_DIR="/usr/local/bin"
-BIN_PATH="${INSTALL_DIR}/${APP_NAME}"
-CONFIG_DIR="/etc/picotun"
-SYSTEMD_DIR="/etc/systemd/system"
-BUILD_DIR="/tmp/picobuild"
+# Where things live
+INSTALL_DIR="/etc/${BIN_NAME}"
+CONFIG_DIR="${INSTALL_DIR}"
+BIN_PATH="/usr/local/bin/${BIN_NAME}"
 
-# ----------------------------------------------------------------------------
-# Helper Functions
-# ----------------------------------------------------------------------------
+SERVICE_SERVER="${BIN_NAME}-server"
+SERVICE_CLIENT="${BIN_NAME}-client"
 
-banner() {
-    clear
-    echo -e "${CYAN}"
-    echo -e "${GREEN}*** RsTunnel (Dagger Style)  ***${NC}"
-    echo -e "${BLUE}_____________________________${NC}"
-    echo -e "${RED}*** POWERED BY HTTPMUX ***${NC}"
-    echo -e "${BLUE}_____________________________${NC}"
-    echo -e "${GREEN}*** Private Tunneling ***${NC}"
-    echo ""
+# If you publish releases, upload assets with these names:
+#   picotun-linux-amd64
+#   picotun-linux-arm64
+RELEASE_ASSET_PREFIX="${BIN_NAME}-linux"
+
+# If you MUST build from source:
+GO_MIN_VERSION="1.22.1"
+
+# ---------- Colors ----------
+RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[0;33m'
+CYAN='\033[0;36m'; GRAY='\033[0;90m'; NC='\033[0m'
+
+ok(){ echo -e "${GREEN}✓${NC} $*"; }
+warn(){ echo -e "${YELLOW}!${NC} $*"; }
+err(){ echo -e "${RED}✖${NC} $*"; }
+info(){ echo -e "${CYAN}$*${NC}"; }
+muted(){ echo -e "${GRAY}$*${NC}"; }
+
+need_root() {
+  if [[ "${EUID:-$(id -u)}" -ne 0 ]]; then
+    err "Run as root."
+    exit 1
+  fi
 }
 
-check_root() {
-    if [[ $EUID -ne 0 ]]; then
-        echo -e "${RED}❌ This script must be run as root${NC}"
-        exit 1
-    fi
+pause(){ read -r -p "Press Enter to return..." _; }
+
+banner(){
+  clear || true
+  echo -e "${CYAN}***  ${APP_NAME}  ***${NC}"
+  echo -e "${CYAN}_____________________________${NC}"
+  echo -e "${CYAN}***  TELEGRAM : @DaggerConnect ***${NC}"
+  echo -e "${CYAN}_____________________________${NC}"
+  echo -e "${CYAN}***  ${APP_NAME} ***${NC}"
+  echo
 }
 
-pause() {
-    echo ""
-    read -p "Press Enter to return..."
+ask(){
+  local prompt="$1" def="${2:-}"
+  local v=""
+  if [[ -n "$def" ]]; then
+    read -r -p "${prompt} [${def}]: " v
+    echo "${v:-$def}"
+  else
+    read -r -p "${prompt}: " v
+    echo "$v"
+  fi
 }
 
-# ----------------------------------------------------------------------------
-# Core Installation & Updates
-# ----------------------------------------------------------------------------
-
-install_deps() {
-    local MISSING_DEPS=0
-    for cmd in curl wget git tar openssl ip; do
-        if ! command -v $cmd &> /dev/null; then
-            MISSING_DEPS=1
-        fi
-    done
-
-    if [ $MISSING_DEPS -eq 0 ]; then
-        echo -e "${GREEN}✓ Dependencies already installed${NC}"
-        return
-    fi
-
-    echo -e "${YELLOW}📦 Installing dependencies...${NC}"
-    if command -v apt &>/dev/null; then
-        apt-get update -qq >/dev/null
-        apt-get install -y curl wget git tar openssl iproute2 >/dev/null 2>&1
-    elif command -v yum &>/dev/null; then
-        yum install -y curl wget git tar openssl iproute2 >/dev/null 2>&1
-    fi
-    echo -e "${GREEN}✓ Dependencies installed${NC}"
+ask_yn(){
+  local prompt="$1" def="${2:-Y}"
+  local v=""
+  read -r -p "${prompt} [${def}/n]: " v
+  v="${v:-$def}"
+  [[ "$v" =~ ^[Yy]$ ]]
 }
 
-install_go() {
-    # Check if Go is already installed
-    if command -v go &> /dev/null; then
-        local GO_VERSION=$(go version | grep -oE "go[0-9]+\.[0-9]+")
-        # Check if version is 1.22 or higher (simple check)
-        if [[ "$GO_VERSION" == *"1.22"* ]] || [[ "$GO_VERSION" == *"1.23"* ]] || [[ "$GO_VERSION" == *"1.24"* ]]; then
-             echo -e "${GREEN}✓ Go environment ready ($GO_VERSION).${NC}"
-             return
-        fi
-    fi
-
-    echo -e "${YELLOW}⬇️  Installing Go 1.22.1 (Mirror)...${NC}"
-    
-    # Clean old go
-    rm -rf /usr/local/go
-    
-    # Download from mirror for Iran
-    wget -q --show-progress "https://mirrors.aliyun.com/golang/go1.22.1.linux-amd64.tar.gz" -O /tmp/go.tgz
-    tar -C /usr/local -xzf /tmp/go.tgz
-    rm -f /tmp/go.tgz
-    
-    # Update PATH temporarily for this session
-    export PATH=$PATH:/usr/local/go/bin
-    
-    echo -e "${GREEN}✓ Go environment installed.${NC}"
+safe_cd_root(){
+  cd / || true
 }
 
-update_core() {
-    install_deps
-    install_go
-    
-    # Ensure PATH is correct
-    export PATH=$PATH:/usr/local/go/bin
-    export GOPROXY=https://goproxy.cn,direct
-    export GOSUMDB=off
-
-    echo -e "${YELLOW}⬇️  Preparing source code...${NC}"
-    
-    # Fix for getcwd error: ensure we are in a safe dir before deleting build dir
-    cd /root
-    rm -rf "$BUILD_DIR"
-    
-    echo -e "${YELLOW}🌐 Cloning from GitHub ...${NC}"
-    if ! git clone --depth 1 "$REPO_URL" "$BUILD_DIR" >/dev/null 2>&1; then
-        echo -e "${RED}✖ Clone failed. Check internet connection.${NC}"
-        return
-    fi
-    
-    cd "$BUILD_DIR" || { echo -e "${RED}✖ Failed to enter build dir${NC}"; return; }
-    
-    echo -e "${YELLOW}🔧 Fixing build environment (Iran Safe)...${NC}"
-    
-    # Initialize module cleanly to fix dependency errors
-    rm -f go.mod go.sum
-    # Using the module name expected by your code imports
-    go mod init github.com/amir6dev/rstunnel/PicoTun
-    
-    echo -e "${YELLOW}📦 Downloading Libraries...${NC}"
-    # Force tidy to download exactly what's needed
-    go mod tidy
-    
-    echo -e "${YELLOW}🔨 Building binary...${NC}"
-    # Build the server/client binary
-    if [ -d "cmd/picotun" ]; then
-        go build -trimpath -ldflags="-s -w" -o picotun ./cmd/picotun
-    else
-        # Fallback if structure is flat
-        go build -trimpath -ldflags="-s -w" -o picotun .
-    fi
-    
-    if [ ! -f "picotun" ]; then
-        echo -e "${RED}✖ Build failed. Binary not created.${NC}"
-        return
-    fi
-    
-    # Stop services before replacing
-    systemctl stop picotun-server 2>/dev/null
-    systemctl stop picotun-client 2>/dev/null
-    
-    cp picotun "$BIN_PATH"
-    chmod +x "$BIN_PATH"
-    
-    # Clean up
-    cd /root
-    rm -rf "$BUILD_DIR"
-    
-    echo -e "${GREEN}✓ Core updated successfully: ${BIN_PATH}${NC}"
-    sleep 2
+detect_arch(){
+  local m
+  m="$(uname -m || true)"
+  case "$m" in
+    x86_64|amd64) echo "amd64" ;;
+    aarch64|arm64) echo "arm64" ;;
+    *) echo "amd64" ;;
+  esac
 }
 
-# ----------------------------------------------------------------------------
-# Configuration Wizards
-# ----------------------------------------------------------------------------
+have(){ command -v "$1" >/dev/null 2>&1; }
 
-# Generate Random PSK
-gen_psk() {
-    openssl rand -hex 16
+# ---------- Dependencies ----------
+pkg_install(){
+  local pkgs=("$@")
+  if have apt-get; then
+    apt-get update -y >/dev/null 2>&1 || true
+    DEBIAN_FRONTEND=noninteractive apt-get install -y "${pkgs[@]}"
+  elif have yum; then
+    yum install -y "${pkgs[@]}"
+  elif have dnf; then
+    dnf install -y "${pkgs[@]}"
+  elif have apk; then
+    apk add --no-cache "${pkgs[@]}"
+  else
+    err "No supported package manager found."
+    exit 1
+  fi
 }
 
-install_server() {
-    banner
-    # Ensure Core is installed
-    if [ ! -f "$BIN_PATH" ]; then
-        update_core
-        banner
-    fi
+ensure_deps(){
+  info "📦 Checking dependencies..."
+  local miss=()
+  for c in curl git tar; do
+    have "$c" || miss+=("$c")
+  done
 
-    echo -e "${CYAN}═══════════════════════════════════════${NC}"
-    echo -e "${CYAN}      SERVER CONFIGURATION${NC}"
-    echo -e "${CYAN}═══════════════════════════════════════${NC}"
-    echo ""
-    
-    read -p "Tunnel Port [2020]: " TUNNEL_PORT
-    TUNNEL_PORT=${TUNNEL_PORT:-2020}
-    
-    read -p "Enter PSK (Pre-Shared Key) [Leave empty to generate]: " USER_PSK
-    if [ -z "$USER_PSK" ]; then
-        PSK=$(gen_psk)
-        echo -e "${GREEN}Generated PSK: ${PSK}${NC}"
-    else
-        PSK="$USER_PSK"
-    fi
-    
-    echo ""
-    echo -e "${YELLOW}Select Transport:${NC}"
-    echo "  1) httpsmux  - HTTPS Mimicry (Recommended)"
-    echo "  2) httpmux   - HTTP Mimicry"
-    echo "  3) wssmux    - WebSocket Secure (TLS)"
-    echo "  4) wsmux     - WebSocket"
-    echo "  5) kcpmux    - KCP (UDP based)"
-    echo "  6) tcpmux    - Simple TCP"
-    read -p "Choice [1-6]: " TRANS_CHOICE
-    
-    case $TRANS_CHOICE in
-        1) TRANSPORT="httpsmux" ;;
-        2) TRANSPORT="httpmux" ;;
-        3) TRANSPORT="wssmux" ;;
-        4) TRANSPORT="wsmux" ;;
-        5) TRANSPORT="kcpmux" ;;
-        6) TRANSPORT="tcpmux" ;;
-        *) TRANSPORT="httpmux" ;;
-    esac
+  if ((${#miss[@]}==0)); then
+    ok "Dependencies already installed"
+    return 0
+  fi
 
-    echo ""
-    echo -e "${CYAN}═══════════════════════════════════════${NC}"
-    echo -e "${CYAN}      PORT MAPPINGS${NC}"
-    echo -e "${CYAN}═══════════════════════════════════════${NC}"
-    echo ""
-    
-    MAPS_YAML=""
-    COUNT=1
-    while true; do
-        echo -e "${YELLOW}Port Mapping #${COUNT}${NC}"
-        read -p "Bind Port (port on this server, e.g., 2222): " BIND_PORT
-        read -p "Target Port (destination port, e.g., 22): " TARGET_PORT
-        read -p "Protocol (tcp/udp/both) [tcp]: " PROTO
-        PROTO=${PROTO:-tcp}
-        
-        MAPS_YAML="${MAPS_YAML}  - type: ${PROTO}\n    bind: \"0.0.0.0:${BIND_PORT}\"\n    target: \"127.0.0.1:${TARGET_PORT}\"\n"
-        
-        echo -e "${GREEN}✓ Mapping added: 0.0.0.0:${BIND_PORT} → 127.0.0.1:${TARGET_PORT} (${PROTO})${NC}"
-        
-        echo ""
-        read -p "Add another mapping? [y/N]: " YN
-        if [[ ! "$YN" =~ ^[Yy] ]]; then
-            break
-        fi
-        COUNT=$((COUNT+1))
-    done
-    
-    create_service "server"
-    
-    echo ""
-    read -p "Optimize system now? [Y/n]: " OPT
-    if [[ ! "$OPT" =~ ^[Nn] ]]; then
-         optimize_system
+  warn "Installing missing: ${miss[*]}"
+  pkg_install "${miss[@]}"
+  ok "Dependencies installed"
+}
+
+# ---------- Iran-friendly core install ----------
+# We try:
+#  1) GitHub Releases asset (prebuilt)  ✅ recommended
+#  2) Build from source (requires Go)    fallback
+download_url(){
+  local url="$1" out="$2"
+  curl -fL --retry 3 --retry-delay 1 --connect-timeout 10 --max-time 180 "$url" -o "$out"
+}
+
+install_prebuilt_binary(){
+  local arch asset tmp
+  arch="$(detect_arch)"
+  asset="${RELEASE_ASSET_PREFIX}-${arch}"
+
+  info "⬇️  Installing core (prebuilt binary preferred)..."
+  tmp="$(mktemp -d /tmp/picotun-bin.XXXXXX)"
+  trap 'rm -rf "$tmp" 2>/dev/null || true' RETURN
+
+  # Direct + proxies (some Iran servers need proxy for GitHub)
+  local urls=(
+    "https://github.com/${REPO_OWNER}/${REPO_NAME}/releases/latest/download/${asset}"
+    "https://mirror.ghproxy.com/https://github.com/${REPO_OWNER}/${REPO_NAME}/releases/latest/download/${asset}"
+    "https://ghproxy.com/https://github.com/${REPO_OWNER}/${REPO_NAME}/releases/latest/download/${asset}"
+  )
+
+  local out="${tmp}/${BIN_NAME}"
+  local got=0
+  for u in "${urls[@]}"; do
+    muted "   Downloading: $u"
+    if download_url "$u" "$out"; then
+      got=1
+      break
     fi
-    
-    # Write Config
-    mkdir -p "$CONFIG_DIR"
-    cat > "$CONFIG_DIR/server.yaml" <<EOF
+  done
+
+  if [[ "$got" -ne 1 ]]; then
+    warn "Prebuilt binary not available (or blocked). Falling back to build-from-source."
+    return 1
+  fi
+
+  chmod +x "$out"
+  install -m 0755 "$out" "$BIN_PATH"
+  ok "Installed binary to ${BIN_PATH}"
+  return 0
+}
+
+# ---------- Go fallback install (for build-from-source) ----------
+# Iran note: Go download may be blocked; we try package manager first.
+go_version(){
+  have go || { echo ""; return 0; }
+  go version 2>/dev/null | awk '{print $3}' | sed 's/^go//'
+}
+
+ver_ge(){
+  # return 0 if $1 >= $2 (simple semver-ish compare)
+  python3 - <<'PY' "$1" "$2"
+import sys
+def norm(v):
+    v=v.strip()
+    if v.startswith("go"): v=v[2:]
+    parts=[int(x) for x in v.split(".") if x.isdigit()]
+    while len(parts)<3: parts.append(0)
+    return parts[:3]
+a=norm(sys.argv[1]); b=norm(sys.argv[2])
+sys.exit(0 if a>=b else 1)
+PY
+}
+
+install_go_from_pkg(){
+  info "⬇️  Installing Go from package manager (Iran-friendly)..."
+  if have apt-get; then
+    pkg_install golang-go || return 1
+  elif have yum; then
+    pkg_install golang || return 1
+  elif have dnf; then
+    pkg_install golang || return 1
+  elif have apk; then
+    pkg_install go || return 1
+  else
+    return 1
+  fi
+  return 0
+}
+
+ensure_go(){
+  info "⬇️  Checking Go..."
+  local cur
+  cur="$(go_version)"
+
+  if [[ -n "$cur" ]] && ver_ge "$cur" "$GO_MIN_VERSION"; then
+    ok "Go $cur is OK (>= $GO_MIN_VERSION)"
+    return 0
+  fi
+
+  # Try package manager first (best for Iran servers)
+  if install_go_from_pkg; then
+    cur="$(go_version)"
+    if [[ -n "$cur" ]] && ver_ge "$cur" "$GO_MIN_VERSION"; then
+      ok "Go installed via package manager: $cur"
+      return 0
+    fi
+    warn "Go from package manager is $cur (needs >= $GO_MIN_VERSION). Will try manual tarball only if you provide a mirror."
+  fi
+
+  # Manual tarball requires a reachable mirror (user can set GO_TARBALL_URL)
+  if [[ -n "${GO_TARBALL_URL:-}" ]]; then
+    local tmp arch tarball
+    arch="$(detect_arch)"
+    tarball="go${GO_MIN_VERSION}.linux-${arch}.tar.gz"
+    tmp="$(mktemp -d /tmp/picotun-go.XXXXXX)"
+    trap 'rm -rf "$tmp" 2>/dev/null || true' RETURN
+    info "   Downloading Go from mirror (GO_TARBALL_URL)..."
+    download_url "${GO_TARBALL_URL}" "${tmp}/${tarball}" || { err "Failed to download Go from GO_TARBALL_URL"; exit 1; }
+    rm -rf /usr/local/go || true
+    tar -C /usr/local -xzf "${tmp}/${tarball}"
+    export PATH="$PATH:/usr/local/go/bin"
+    cur="$(go_version)"
+    if [[ -n "$cur" ]] && ver_ge "$cur" "$GO_MIN_VERSION"; then
+      ok "Go installed from mirror: $cur"
+      return 0
+    fi
+  fi
+
+  err "Go is not available (>= $GO_MIN_VERSION)."
+  echo
+  echo "Iran-friendly options:"
+  echo "  1) Publish prebuilt binaries in GitHub Releases (recommended) and rerun setup."
+  echo "  2) Or set GO_TARBALL_URL to a reachable mirror, e.g.:"
+  echo "     GO_TARBALL_URL='https://your-mirror/go${GO_MIN_VERSION}.linux-amd64.tar.gz' bash <(curl -fsSL .../setup.sh)"
+  echo
+  exit 1
+}
+
+clone_repo(){
+  local repo_url="$1" branch="$2"
+  safe_cd_root
+  local builddir
+  builddir="$(mktemp -d /tmp/picobuild.XXXXXX)"
+  info "🌐 Cloning from GitHub ..."
+  git clone --depth 1 --branch "$branch" "$repo_url" "$builddir" >/dev/null
+  echo "$builddir"
+}
+
+build_from_source(){
+  local repo_url="$1" branch="$2"
+  ensure_deps
+  ensure_go
+
+  info "⬇️  Preparing source code..."
+  local builddir
+  builddir="$(clone_repo "$repo_url" "$branch")"
+  trap 'rm -rf "$builddir" 2>/dev/null || true' RETURN
+
+  info "📦 Downloading Libraries..."
+  export GOFLAGS="-mod=mod"
+  export GOPROXY="${GOPROXY:-https://goproxy.cn,direct}"
+  (cd "$builddir" && go mod download) || true
+  (cd "$builddir" && go mod tidy) || true
+
+  info "🔨 Building binary..."
+  if [[ -d "${builddir}/cmd/picotun" ]]; then
+    (cd "$builddir" && go build -trimpath -ldflags="-s -w" -o "${BIN_NAME}" ./cmd/picotun)
+  else
+    (cd "$builddir" && go build -trimpath -ldflags="-s -w" -o "${BIN_NAME}" .)
+  fi
+
+  [[ -f "${builddir}/${BIN_NAME}" ]] || { err "Build failed: binary not created"; exit 1; }
+
+  install -m 0755 "${builddir}/${BIN_NAME}" "$BIN_PATH"
+  ok "Installed binary to ${BIN_PATH}"
+}
+
+ensure_core(){
+  local repo_url="$1" branch="$2"
+
+  # If binary exists, keep it (Update Core menu handles updates)
+  if [[ -x "$BIN_PATH" ]]; then
+    ok "Core already installed (${BIN_PATH})"
+    return 0
+  fi
+
+  # Try prebuilt binary (no Go needed)
+  if install_prebuilt_binary; then
+    return 0
+  fi
+
+  # Fallback build
+  build_from_source "$repo_url" "$branch"
+}
+
+# ---------- systemd ----------
+write_server_service(){
+  local cfg="$1"
+  cat > "/etc/systemd/system/${SERVICE_SERVER}.service" <<EOF
+[Unit]
+Description=${APP_NAME} Server Service
+After=network.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=${INSTALL_DIR}
+ExecStart=${BIN_PATH} -c ${cfg}
+Restart=always
+RestartSec=3
+StandardOutput=journal
+StandardError=journal
+LimitNOFILE=1048576
+
+[Install]
+WantedBy=multi-user.target
+EOF
+}
+
+write_client_service(){
+  local cfg="$1"
+  cat > "/etc/systemd/system/${SERVICE_CLIENT}.service" <<EOF
+[Unit]
+Description=${APP_NAME} Client Service
+After=network.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=${INSTALL_DIR}
+ExecStart=${BIN_PATH} -c ${cfg}
+Restart=always
+RestartSec=3
+StandardOutput=journal
+StandardError=journal
+LimitNOFILE=1048576
+
+[Install]
+WantedBy=multi-user.target
+EOF
+}
+
+systemd_reload(){
+  systemctl daemon-reload
+}
+
+enable_start(){
+  local svc="$1"
+  systemctl enable --now "${svc}.service"
+}
+
+ua_by_choice(){
+  local c="$1"
+  case "$c" in
+    1) echo "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36" ;;
+    2) echo "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:122.0) Gecko/20100101 Firefox/122.0" ;;
+    3) echo "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36" ;;
+    4) echo "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.2 Safari/605.1.15" ;;
+    5) echo "Mozilla/5.0 (Linux; Android 13; Pixel 7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36" ;;
+    *) echo "Mozilla/5.0" ;;
+  esac
+}
+
+gen_psk(){
+  # 16 chars
+  tr -dc 'A-Za-z0-9' </dev/urandom | head -c 16
+}
+
+# ---------- Flows ----------
+install_server(){
+  banner
+  local repo_url branch
+  repo_url="$(ask "Repo URL" "https://github.com/${REPO_OWNER}/${REPO_NAME}.git")"
+  branch="$(ask "Repo branch" "${REPO_BRANCH_DEFAULT}")"
+
+  ensure_deps
+  ensure_core "$repo_url" "$branch"
+
+  echo -e "${CYAN}═══════════════════════════════════════${NC}"
+  echo -e "${CYAN}      SERVER CONFIGURATION${NC}"
+  echo -e "${CYAN}═══════════════════════════════════════${NC}"
+  echo
+
+  local tunnel_port user_psk psk transport
+  tunnel_port="$(ask "Tunnel Port" "2020")"
+  user_psk="$(ask "Enter PSK (Pre-Shared Key) [Leave empty to generate]" "")"
+  if [[ -z "$user_psk" ]]; then
+    psk="$(gen_psk)"
+    ok "Generated PSK: ${psk}"
+  else
+    psk="$user_psk"
+  fi
+
+  echo
+  echo -e "${YELLOW}Select Transport:${NC}"
+  echo "  1) httpsmux  - HTTPS Mimicry (Recommended)"
+  echo "  2) httpmux   - HTTP Mimicry"
+  echo "  3) wssmux    - WebSocket Secure (TLS)"
+  echo "  4) wsmux     - WebSocket"
+  echo "  5) kcpmux    - KCP (UDP based)"
+  echo "  6) tcpmux    - Simple TCP"
+  local ch
+  ch="$(ask "Choice [1-6]" "2")"
+  case "$ch" in
+    1) transport="httpsmux" ;;
+    2) transport="httpmux" ;;
+    3) transport="wssmux" ;;
+    4) transport="wsmux" ;;
+    5) transport="kcpmux" ;;
+    6) transport="tcpmux" ;;
+    *) transport="httpmux" ;;
+  esac
+
+  echo
+  echo -e "${CYAN}═══════════════════════════════════════${NC}"
+  echo -e "${CYAN}      PORT MAPPINGS${NC}"
+  echo -e "${CYAN}═══════════════════════════════════════${NC}"
+  echo
+
+  local maps_yaml=""
+  local count=1
+  while true; do
+    echo -e "${YELLOW}Port Mapping #${count}${NC}"
+    local bind_port target_port proto
+    bind_port="$(ask "Bind Port (port on this server, e.g., 2222)" "")"
+    target_port="$(ask "Target Port (destination port, e.g., 22)" "")"
+    proto="$(ask "Protocol (tcp/udp/both)" "tcp")"
+    maps_yaml+=$'  - type: '"${proto}"$'\n    bind: "0.0.0.0:'"${bind_port}"$'"\n    target: "127.0.0.1:'"${target_port}"$'"\n'
+    ok "Mapping added: 0.0.0.0:${bind_port} → 127.0.0.1:${target_port} (${proto})"
+    echo
+    if ! ask_yn "Add another mapping?" "N"; then
+      break
+    fi
+    count=$((count+1))
+  done
+
+  local optimize
+  echo
+  optimize="$(ask "Optimize system now?" "n")"
+  # (optional optimizer hook later)
+
+  mkdir -p "$CONFIG_DIR"
+  local cfg="${CONFIG_DIR}/server.yaml"
+
+  cat > "$cfg" <<EOF
 mode: "server"
-listen: "0.0.0.0:${TUNNEL_PORT}"
-transport: "${TRANSPORT}"
-psk: "${PSK}"
+listen: "0.0.0.0:${tunnel_port}"
+transport: "${transport}"
+psk: "${psk}"
 profile: "latency"
 verbose: true
 
 heartbeat: 2
 
 maps:
-$(echo -e "$MAPS_YAML")
-
-smux:
-  keepalive: 5
-  max_recv: 524288
-  max_stream: 524288
-  frame_size: 2048
-  version: 2
+$(echo -e "${maps_yaml}")
 
 advanced:
   session_timeout: 15
@@ -292,7 +499,7 @@ obfuscation:
 http_mimic:
   fake_domain: "www.google.com"
   fake_path: "/search"
-  user_agent: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+  user_agent: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
   chunked_encoding: false
   session_cookie: true
   custom_headers:
@@ -300,145 +507,156 @@ http_mimic:
     - "Accept-Encoding: gzip, deflate, br"
 EOF
 
-    systemctl restart picotun-server
-    
-    echo ""
-    echo -e "${GREEN}═══════════════════════════════════════${NC}"
-    echo -e "${GREEN}   ✓ Server configured (Optimized)${NC}"
-    echo -e "${GREEN}═══════════════════════════════════════${NC}"
-    echo ""
-    echo -e "  Tunnel Port: ${YELLOW}${TUNNEL_PORT}${NC}"
-    echo -e "  PSK: ${YELLOW}${PSK}${NC}"
-    echo -e "  Transport: ${YELLOW}${TRANSPORT}${NC}"
-    echo -e "  Config: ${YELLOW}${CONFIG_DIR}/server.yaml${NC}"
-    echo ""
-    pause
+  write_server_service "$cfg"
+  systemd_reload
+  enable_start "$SERVICE_SERVER"
+
+  echo
+  echo -e "${GREEN}═══════════════════════════════════════${NC}"
+  echo -e "${GREEN}   ✓ Server configured${NC}"
+  echo -e "${GREEN}═══════════════════════════════════════${NC}"
+  echo
+  echo -e "  Tunnel Port: ${YELLOW}${tunnel_port}${NC}"
+  echo -e "  PSK: ${YELLOW}${psk}${NC}"
+  echo -e "  Transport: ${YELLOW}${transport}${NC}"
+  echo -e "  Config: ${YELLOW}${cfg}${NC}"
+  echo
+  pause
 }
 
+install_client(){
+  banner
+  local repo_url branch
+  repo_url="$(ask "Repo URL" "https://github.com/${REPO_OWNER}/${REPO_NAME}.git")"
+  branch="$(ask "Repo branch" "${REPO_BRANCH_DEFAULT}")"
 
-install_client() {
-    banner
-    # Ensure Core is installed
-    if [ ! -f "$BIN_PATH" ]; then
-        update_core
-        banner
-    fi
+  ensure_deps
+  ensure_core "$repo_url" "$branch"
 
-    echo -e "${CYAN}═══════════════════════════════════════${NC}"
-    echo -e "${CYAN}      CLIENT CONFIGURATION${NC}"
-    echo -e "${CYAN}═══════════════════════════════════════${NC}"
-    echo ""
-    
-    echo "Configuration Mode:"
-    echo "  1) Automatic - Optimized settings (Recommended)"
-    echo "  2) Manual - Custom configuration"
-    echo ""
-    read -p "Choice [1-2]: " MODE
-    
-    read -p "Enter PSK (must match server): " PSK
-    
-    echo ""
-    echo -e "${YELLOW}Select Performance Profile:${NC}"
-    echo "  1) balanced      - Standard balanced performance (Recommended)"
-    echo "  2) aggressive    - High speed, aggressive settings"
-    echo "  3) latency       - Optimized for low latency"
-    echo "  4) cpu-efficient - Low CPU usage"
-    echo "  5) gaming        - Optimized for gaming (low latency + high speed)"
-    read -p "Choice [1-5]: " PROFILE_SEL
-    case $PROFILE_SEL in
-        1) PROFILE="balanced" ;;
-        2) PROFILE="aggressive" ;;
-        3) PROFILE="latency" ;;
-        4) PROFILE="cpu-efficient" ;;
-        5) PROFILE="gaming" ;;
-        *) PROFILE="balanced" ;;
-    esac
-    
-    echo ""
-    read -p "Enable Traffic Obfuscation? [Y/n]: " OBFS
-    if [[ "$OBFS" =~ ^[Nn] ]]; then OBFS_BOOL="false"; else OBFS_BOOL="true"; fi
+  echo -e "${CYAN}═══════════════════════════════════════${NC}"
+  echo -e "${CYAN}      CLIENT CONFIGURATION${NC}"
+  echo -e "${CYAN}═══════════════════════════════════════${NC}"
+  echo
 
-    echo ""
-    echo -e "${CYAN}═══════════════════════════════════════${NC}"
-    echo -e "${CYAN}      CONNECTION PATHS${NC}"
-    echo -e "${CYAN}═══════════════════════════════════════${NC}"
-    echo ""
-    echo -e "${YELLOW}Add Connection Path #1${NC}"
-    echo "Select Transport Type:"
-    echo "  1) tcpmux   - TCP Multiplexing"
-    echo "  2) kcpmux   - KCP Multiplexing (UDP)"
-    echo "  3) wsmux    - WebSocket"
-    echo "  4) wssmux   - WebSocket Secure"
-    echo "  5) httpmux  - HTTP Mimicry"
-    echo "  6) httpsmux - HTTPS Mimicry ⭐"
-    read -p "Choice [1-6]: " TRANS_CHOICE
-    case $TRANS_CHOICE in
-        1) TRANSPORT="tcpmux" ;;
-        2) TRANSPORT="kcpmux" ;;
-        3) TRANSPORT="wsmux" ;;
-        4) TRANSPORT="wssmux" ;;
-        5) TRANSPORT="httpmux" ;;
-        6) TRANSPORT="httpsmux" ;;
-        *) TRANSPORT="httpmux" ;;
-    esac
+  echo "Configuration Mode:"
+  echo "  1) Automatic - Optimized settings (Recommended)"
+  echo "  2) Manual - Custom configuration"
+  local mode_choice
+  mode_choice="$(ask "Choice [1-2]" "2")"
+  # (currently both behave same; keeps UX like Dagger)
 
-    read -p "Server address with Tunnel Port (e.g., 1.2.3.4:2020): " SERVER_ADDR
-    read -p "Connection pool size [2]: " POOL
-    POOL=${POOL:-2}
-    read -p "Enable aggressive pool? [y/N]: " AGGR
-    [[ "$AGGR" =~ ^[Yy] ]] && AGGR_BOOL="true" || AGGR_BOOL="false"
-    
-    echo ""
-    echo -e "${CYAN}═══════════════════════════════════════${NC}"
-    echo -e "${CYAN}      HTTP MIMICRY SETTINGS${NC}"
-    echo -e "${CYAN}═══════════════════════════════════════${NC}"
-    echo ""
-    read -p "Fake domain (e.g., www.google.com) [www.google.com]: " FAKE_DOMAIN
-    FAKE_DOMAIN=${FAKE_DOMAIN:-www.google.com}
-    read -p "Fake path (e.g., /search) [/search]: " FAKE_PATH
-    FAKE_PATH=${FAKE_PATH:-/search}
-    
-    echo ""
-    echo "Select User-Agent:"
-    echo "  1) Chrome Windows (default)"
-    echo "  2) Firefox Windows"
-    read -p "Choice [1-2]: " UA_CHOICE
-    if [ "$UA_CHOICE" == "2" ]; then
-        UA="Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:121.0) Gecko/20100101 Firefox/121.0"
-    else
-        UA="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-    fi
-    
-    read -p "Enable chunked encoding? [Y/n]: " CHUNKED
-    [[ "$CHUNKED" =~ ^[Nn] ]] && CHUNKED_BOOL="false" || CHUNKED_BOOL="true"
-    read -p "Enable session cookies? [Y/n]: " COOKIES
-    [[ "$COOKIES" =~ ^[Nn] ]] && COOKIES_BOOL="false" || COOKIES_BOOL="true"
-    
-    echo -e "${GREEN}✓ Path added: ${TRANSPORT} -> ${SERVER_ADDR} (pool: ${POOL}, aggressive: ${AGGR_BOOL})${NC}"
-    echo ""
-    read -p "Enable verbose logging? [y/N]: " VERBOSE
-    [[ "$VERBOSE" =~ ^[Yy] ]] && VERBOSE_BOOL="true" || VERBOSE_BOOL="false"
+  local psk
+  psk="$(ask "Enter PSK (must match server)" "")"
 
-    create_service "client"
-    
-    # Write Config
-    mkdir -p "$CONFIG_DIR"
-    cat > "$CONFIG_DIR/client.yaml" <<EOF
+  echo
+  echo "Select Performance Profile:"
+  echo "  1) balanced      - Standard balanced performance (Recommended)"
+  echo "  2) aggressive    - High speed, aggressive settings"
+  echo "  3) latency       - Optimized for low latency"
+  echo "  4) cpu-efficient - Low CPU usage"
+  echo "  5) gaming        - Optimized for gaming (low latency + high speed)"
+  local pchoice
+  pchoice="$(ask "Choice [1-5]" "1")"
+  local profile="balanced"
+  case "$pchoice" in
+    1) profile="balanced" ;;
+    2) profile="aggressive" ;;
+    3) profile="latency" ;;
+    4) profile="cpu-efficient" ;;
+    5) profile="gaming" ;;
+  esac
+
+  local obfs_enabled="false"
+  if ask_yn "Enable Traffic Obfuscation?" "Y"; then
+    obfs_enabled="true"
+  fi
+
+  echo
+  echo -e "${CYAN}═══════════════════════════════════════${NC}"
+  echo -e "${CYAN}      CONNECTION PATHS${NC}"
+  echo -e "${CYAN}═══════════════════════════════════════${NC}"
+  echo
+
+  echo "Select Transport Type:"
+  echo "  1) tcpmux   - TCP Multiplexing"
+  echo "  2) kcpmux   - KCP Multiplexing (UDP)"
+  echo "  3) wsmux    - WebSocket"
+  echo "  4) wssmux   - WebSocket Secure"
+  echo "  5) httpmux  - HTTP Mimicry"
+  echo "  6) httpsmux - HTTPS Mimicry ⭐"
+  local tchoice
+  tchoice="$(ask "Choice [1-6]" "5")"
+  local transport="httpmux"
+  case "$tchoice" in
+    1) transport="tcpmux" ;;
+    2) transport="kcpmux" ;;
+    3) transport="wsmux" ;;
+    4) transport="wssmux" ;;
+    5) transport="httpmux" ;;
+    6) transport="httpsmux" ;;
+  esac
+
+  local addr pool aggressive retry dial_timeout
+  addr="$(ask "Server address with Tunnel Port (e.g., 1.2.3.4:4000)" "")"
+  pool="$(ask "Connection pool size" "2")"
+  aggressive="false"
+  if ask_yn "Enable aggressive pool?" "N"; then aggressive="true"; fi
+  retry="$(ask "Retry interval (seconds)" "3")"
+  dial_timeout="$(ask "Dial timeout (seconds)" "10")"
+
+  echo
+  echo -e "${CYAN}═══════════════════════════════════════${NC}"
+  echo -e "${CYAN}      HTTP MIMICRY SETTINGS${NC}"
+  echo -e "${CYAN}═══════════════════════════════════════${NC}"
+  echo
+
+  local fake_domain fake_path ua chunked session_cookie
+  fake_domain="$(ask "Fake domain (e.g., www.google.com)" "www.google.com")"
+  fake_path="$(ask "Fake path (e.g., /search)" "/search")"
+
+  echo
+  echo "Select User-Agent:"
+  echo "  1) Chrome Windows (default)"
+  echo "  2) Firefox Windows"
+  echo "  3) Chrome macOS"
+  echo "  4) Safari macOS"
+  echo "  5) Chrome Android"
+  echo "  6) Custom"
+  local uac
+  uac="$(ask "Choice [1-6]" "1")"
+  if [[ "$uac" == "6" ]]; then
+    ua="$(ask "Enter custom User-Agent" "Mozilla/5.0")"
+  else
+    ua="$(ua_by_choice "$uac")"
+  fi
+
+  chunked="true"
+  if ! ask_yn "Enable chunked encoding?" "Y"; then chunked="false"; fi
+  session_cookie="true"
+  if ! ask_yn "Enable session cookies?" "Y"; then session_cookie="false"; fi
+
+  local verbose="false"
+  if ask_yn "Enable verbose logging?" "N"; then verbose="true"; fi
+
+  mkdir -p "$CONFIG_DIR"
+  local cfg="${CONFIG_DIR}/client.yaml"
+
+  cat > "$cfg" <<EOF
 mode: "client"
-psk: "${PSK}"
-profile: "${PROFILE}"
-verbose: ${VERBOSE_BOOL}
+psk: "${psk}"
+profile: "${profile}"
+verbose: ${verbose}
 
 paths:
-  - transport: "${TRANSPORT}"
-    addr: "${SERVER_ADDR}"
-    connection_pool: ${POOL}
-    aggressive_pool: ${AGGR_BOOL}
-    retry_interval: 3
-    dial_timeout: 10
+  - transport: "${transport}"
+    addr: "${addr}"
+    connection_pool: ${pool}
+    aggressive_pool: ${aggressive}
+    retry_interval: ${retry}
+    dial_timeout: ${dial_timeout}
 
 obfuscation:
-  enabled: ${OBFS_BOOL}
+  enabled: ${obfs_enabled}
   min_padding: 16
   max_padding: 512
   min_delay_ms: 5
@@ -446,120 +664,137 @@ obfuscation:
   burst_chance: 0.15
 
 http_mimic:
-  fake_domain: "${FAKE_DOMAIN}"
-  fake_path: "${FAKE_PATH}"
-  user_agent: "${UA}"
-  chunked_encoding: ${CHUNKED_BOOL}
-  session_cookie: ${COOKIES_BOOL}
+  fake_domain: "${fake_domain}"
+  fake_path: "${fake_path}"
+  user_agent: "${ua}"
+  chunked_encoding: ${chunked}
+  session_cookie: ${session_cookie}
   custom_headers:
     - "X-Requested-With: XMLHttpRequest"
-    - "Referer: https://${FAKE_DOMAIN}/"
+    - "Referer: https://${fake_domain}/"
 EOF
 
-    systemctl restart picotun-client
-    
-    echo ""
-    echo -e "${GREEN}═══════════════════════════════════════${NC}"
-    echo -e "${GREEN}   ✓ Client installation complete!${NC}"
-    echo -e "${GREEN}═══════════════════════════════════════${NC}"
-    echo ""
-    echo -e "  Profile: ${YELLOW}${PROFILE}${NC}"
-    echo -e "  Obfuscation: ${YELLOW}${OBFS_BOOL}${NC}"
-    echo -e "  Config: ${YELLOW}${CONFIG_DIR}/client.yaml${NC}"
-    echo -e "  View logs: journalctl -u picotun-client -f"
-    echo ""
+  write_client_service "$cfg"
+  systemd_reload
+  enable_start "$SERVICE_CLIENT"
+
+  echo
+  ok "Client installation complete!"
+  echo
+  echo "  Profile: ${profile}"
+  echo "  Obfuscation: ${obfs_enabled}"
+  echo
+  echo "  Config: ${cfg}"
+  echo "  View logs: journalctl -u ${SERVICE_CLIENT} -f"
+  echo
+  pause
+}
+
+settings_menu(){
+  while true; do
+    banner
+    echo "═══════════════════════════════════════"
+    echo "     SETTINGS (Manage Services & Configs)"
+    echo "═══════════════════════════════════════"
+    echo
+    echo "  1) Status"
+    echo "  2) Restart Server"
+    echo "  3) Restart Client"
+    echo "  4) Stop/Disable Server"
+    echo "  5) Stop/Disable Client"
+    echo "  6) Show paths"
+    echo
+    echo "  0) Back"
+    echo
+    local c
+    c="$(ask "Select option" "0")"
+    case "$c" in
+      1)
+        systemctl status "${SERVICE_SERVER}.service" --no-pager || true
+        echo
+        systemctl status "${SERVICE_CLIENT}.service" --no-pager || true
+        pause
+        ;;
+      2) systemctl restart "${SERVICE_SERVER}.service" || true; ok "Server restarted"; pause ;;
+      3) systemctl restart "${SERVICE_CLIENT}.service" || true; ok "Client restarted"; pause ;;
+      4) systemctl disable --now "${SERVICE_SERVER}.service" 2>/dev/null || true; ok "Server disabled"; pause ;;
+      5) systemctl disable --now "${SERVICE_CLIENT}.service" 2>/dev/null || true; ok "Client disabled"; pause ;;
+      6)
+        echo "Binary: ${BIN_PATH}"
+        echo "Config dir: ${CONFIG_DIR}"
+        echo "Server cfg: ${CONFIG_DIR}/server.yaml"
+        echo "Client cfg: ${CONFIG_DIR}/client.yaml"
+        pause
+        ;;
+      0) return ;;
+      *) ;;
+    esac
+  done
+}
+
+update_core(){
+  banner
+  local repo_url branch
+  repo_url="$(ask "Repo URL" "https://github.com/${REPO_OWNER}/${REPO_NAME}.git")"
+  branch="$(ask "Repo branch" "${REPO_BRANCH_DEFAULT}")"
+
+  ensure_deps
+
+  # Try prebuilt first; if fails, build
+  if install_prebuilt_binary; then
+    ok "Core updated."
+    warn "Restart services to apply."
     pause
+    return
+  fi
+
+  build_from_source "$repo_url" "$branch"
+  ok "Core updated (built from source)."
+  warn "Restart services to apply."
+  pause
 }
 
-create_service() {
-    local TYPE=$1
-    local SERVICE_NAME="picotun-${TYPE}"
-    
-    cat > "$SYSTEMD_DIR/${SERVICE_NAME}.service" <<EOF
-[Unit]
-Description=RsTunnel ${TYPE^} Service
-After=network.target
-
-[Service]
-Type=simple
-User=root
-ExecStart=${BIN_PATH} -config ${CONFIG_DIR}/${TYPE}.yaml
-Restart=always
-RestartSec=3
-LimitNOFILE=1048576
-
-[Install]
-WantedBy=multi-user.target
-EOF
-    systemctl daemon-reload
-    systemctl enable "${SERVICE_NAME}" >/dev/null 2>&1
-    echo -e "${GREEN}✓ Systemd service for ${TYPE^} created: ${SERVICE_NAME}.service${NC}"
+uninstall_all(){
+  banner
+  if ! ask_yn "Remove ${APP_NAME} services, configs, and binary?" "n"; then
+    warn "Canceled"
+    pause
+    return
+  fi
+  systemctl disable --now "${SERVICE_SERVER}.service" 2>/dev/null || true
+  systemctl disable --now "${SERVICE_CLIENT}.service" 2>/dev/null || true
+  rm -f "/etc/systemd/system/${SERVICE_SERVER}.service" "/etc/systemd/system/${SERVICE_CLIENT}.service" || true
+  systemctl daemon-reload || true
+  rm -rf "$INSTALL_DIR" || true
+  rm -f "$BIN_PATH" || true
+  ok "Uninstalled."
+  pause
 }
 
-optimize_system() {
-    echo -e "${YELLOW}Applying TCP optimizations...${NC}"
-    cat > /etc/sysctl.d/99-picotun.conf << 'EOF'
-net.core.rmem_max=8388608
-net.core.wmem_max=8388608
-net.core.rmem_default=131072
-net.core.wmem_default=131072
-net.ipv4.tcp_rmem=4096 65536 8388608
-net.ipv4.tcp_wmem=4096 65536 8388608
-net.ipv4.tcp_congestion_control=bbr
-net.core.default_qdisc=fq
-EOF
-    sysctl -p /etc/sysctl.d/99-picotun.conf >/dev/null 2>&1
-    echo -e "${GREEN}✓ System Optimized (BBR + TCP Tweaks)${NC}"
+main_menu(){
+  while true; do
+    banner
+    echo "  1) Install Server"
+    echo "  2) Install Client"
+    echo "  3) Settings (Manage Services & Configs)"
+    echo "  4) Update Core (Prebuilt preferred)"
+    echo "  5) Uninstall"
+    echo
+    echo "  0) Exit"
+    echo
+    local opt
+    opt="$(ask "Select option" "0")"
+    case "$opt" in
+      1) install_server ;;
+      2) install_client ;;
+      3) settings_menu ;;
+      4) update_core ;;
+      5) uninstall_all ;;
+      0) exit 0 ;;
+      *) ;;
+    esac
+  done
 }
 
-uninstall_all() {
-    echo -e "${RED}⚠️  WARNING: This will remove RsTunnel Binary, Configs, and Services!${NC}"
-    read -p "Are you sure? [y/N]: " yn
-    if [[ "$yn" =~ ^[Yy] ]]; then
-        systemctl stop picotun-server picotun-client 2>/dev/null
-        systemctl disable picotun-server picotun-client 2>/dev/null
-        rm -f "$SYSTEMD_DIR/picotun-server.service" "$SYSTEMD_DIR/picotun-client.service"
-        systemctl daemon-reload
-        rm -rf "$CONFIG_DIR" "$BIN_PATH" "$BUILD_DIR"
-        echo -e "${GREEN}✓ Uninstalled completely.${NC}"
-        sleep 2
-        exit 0
-    fi
-}
-
-# ----------------------------------------------------------------------------
-# Main Menu
-# ----------------------------------------------------------------------------
-
-main_menu() {
-    while true; do
-        banner
-        echo "  1) Install Server"
-        echo "  2) Install Client"
-        echo "  3) Settings (Manage Services)"
-        echo "  4) System Optimizer"
-        echo "  5) Update Core (Re-download Binary)"
-        echo "  6) Uninstall RsTunnel"
-        echo ""
-        echo "  0) Exit"
-        echo ""
-        read -p "Select option: " opt
-        
-        case $opt in
-            1) install_server ;;
-            2) install_client ;;
-            3) 
-                echo -e "${YELLOW}To manage services, use systemctl or edit configs in /etc/picotun${NC}"
-                pause
-                ;;
-            4) optimize_system; pause ;;
-            5) update_core ;;
-            6) uninstall_all ;;
-            0) exit 0 ;;
-            *) echo -e "${RED}Invalid option${NC}"; sleep 1 ;;
-        esac
-    done
-}
-
-check_root
+need_root
 main_menu
