@@ -10,10 +10,18 @@ import (
 	"time"
 )
 
+type FrameTransport interface {
+	Start() error
+	Close() error
+	Send(fr *Frame) error
+	Recv() (*Frame, error)
+}
+
 type HTTPConn struct {
 	Client    *http.Client
 	Mimic     *MimicConfig
 	Obfs      *ObfsConfig
+	PSK       string
 	SessionID string
 	ServerURL string
 }
@@ -22,10 +30,16 @@ func (hc *HTTPConn) RoundTrip(payload []byte) ([]byte, error) {
 	if hc.Client == nil {
 		hc.Client = &http.Client{Timeout: 25 * time.Second}
 	}
-	payload = ApplyObfuscation(payload, hc.Obfs)
+
+	// Encrypt -> Obfs
+	enc, err := EncryptPSK(payload, hc.PSK)
+	if err != nil {
+		return nil, err
+	}
+	enc = ApplyObfuscation(enc, hc.Obfs)
 	ApplyDelay(hc.Obfs)
 
-	req, err := http.NewRequest("POST", hc.ServerURL, bytes.NewReader(payload))
+	req, err := http.NewRequest("POST", hc.ServerURL, bytes.NewReader(enc))
 	if err != nil {
 		return nil, err
 	}
@@ -41,13 +55,20 @@ func (hc *HTTPConn) RoundTrip(payload []byte) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	return StripObfuscation(b, hc.Obfs), nil
+
+	// Deobfs -> Decrypt
+	b = StripObfuscation(b, hc.Obfs)
+	plain, err := DecryptPSK(b, hc.PSK)
+	if err != nil {
+		return nil, err
+	}
+	return plain, nil
 }
 
 type HTTPMuxConfig struct {
-	FlushInterval time.Duration // هر چند وقت یک بار اگر فریم هست flush کن
-	MaxBatch      int           // چند فریم در هر درخواست
-	IdlePoll      time.Duration // اگر چیزی برای ارسال نبود، هر چند وقت یکبار poll کن (long-poll ساده)
+	FlushInterval time.Duration
+	MaxBatch      int
+	IdlePoll      time.Duration
 }
 
 type HTTPMuxTransport struct {
@@ -71,13 +92,13 @@ func NewHTTPMuxTransport(conns []*HTTPConn, cfg HTTPMuxConfig) *HTTPMuxTransport
 		cfg.MaxBatch = 64
 	}
 	if cfg.IdlePoll <= 0 {
-		cfg.IdlePoll = 300 * time.Millisecond
+		cfg.IdlePoll = 250 * time.Millisecond
 	}
 	return &HTTPMuxTransport{
 		conns: conns,
 		cfg:   cfg,
-		out:   make(chan *Frame, 2048),
-		in:    make(chan *Frame, 2048),
+		out:   make(chan *Frame, 4096),
+		in:    make(chan *Frame, 4096),
 		die:   make(chan struct{}),
 	}
 }
@@ -94,7 +115,6 @@ func (t *HTTPMuxTransport) Start() error {
 func (t *HTTPMuxTransport) Close() error {
 	select {
 	case <-t.die:
-		// already closed
 	default:
 		close(t.die)
 	}
@@ -134,21 +154,21 @@ func (t *HTTPMuxTransport) loop() {
 	var batch []*Frame
 
 	flush := func() {
-		if len(batch) == 0 {
-			// idle poll: یک درخواست خالی برای گرفتن فریم‌های pending
-			time.Sleep(t.cfg.IdlePoll)
-		}
-
+		// request payload
 		var buf bytes.Buffer
 		for _, fr := range batch {
 			_ = WriteFrame(&buf, fr)
 		}
 		batch = batch[:0]
 
+		// idle poll: اگر چیزی برای ارسال نبود هم گهگاهی poll کن
+		if buf.Len() == 0 {
+			time.Sleep(t.cfg.IdlePoll)
+		}
+
 		conn := t.pickConn()
 		resp, err := conn.RoundTrip(buf.Bytes())
 		if err != nil {
-			// backoff کوچک
 			time.Sleep(200 * time.Millisecond)
 			return
 		}

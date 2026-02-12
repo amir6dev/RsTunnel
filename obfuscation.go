@@ -7,15 +7,15 @@ import (
 )
 
 type ObfsConfig struct {
-	Enabled     bool
-	MinPadding  int
-	MaxPadding  int
-	MinDelayMS  int
-	MaxDelayMS  int
-	BurstChance int // فعلاً استفاده نمی‌کنیم
+	Enabled     bool `yaml:"enabled"`
+	MinPadding  int  `yaml:"min_padding"`
+	MaxPadding  int  `yaml:"max_padding"`
+	MinDelayMS  int  `yaml:"min_delay"`
+	MaxDelayMS  int  `yaml:"max_delay"`
+	BurstChance int  `yaml:"burst_chance"`
 }
 
-// ApplyObfuscation: [2 bytes padLen][data][padding]
+// Wire: [2 bytes padLen][data][padding]
 func ApplyObfuscation(data []byte, cfg *ObfsConfig) []byte {
 	if cfg == nil || !cfg.Enabled {
 		return data
@@ -23,7 +23,10 @@ func ApplyObfuscation(data []byte, cfg *ObfsConfig) []byte {
 
 	pad := cfg.MinPadding
 	if cfg.MaxPadding > cfg.MinPadding {
-		pad = cfg.MinPadding + int(randomByte())%(cfg.MaxPadding-cfg.MinPadding+1)
+		pad = cfg.MinPadding + int(randByte())%(cfg.MaxPadding-cfg.MinPadding+1)
+	}
+	if pad < 0 {
+		pad = 0
 	}
 
 	out := make([]byte, 2+len(data)+pad)
@@ -31,10 +34,8 @@ func ApplyObfuscation(data []byte, cfg *ObfsConfig) []byte {
 	copy(out[2:], data)
 
 	if pad > 0 {
-		padding := out[2+len(data):]
-		_, _ = rand.Read(padding)
+		_, _ = rand.Read(out[2+len(data):])
 	}
-
 	return out
 }
 
@@ -54,7 +55,7 @@ func StripObfuscation(data []byte, cfg *ObfsConfig) []byte {
 }
 
 func ApplyDelay(cfg *ObfsConfig) {
-	if cfg == nil {
+	if cfg == nil || !cfg.Enabled {
 		return
 	}
 	if cfg.MaxDelayMS <= 0 {
@@ -67,12 +68,12 @@ func ApplyDelay(cfg *ObfsConfig) {
 	}
 	d := min
 	if max > min {
-		d = min + int(randomByte())%(max-min+1)
+		d = min + int(randByte())%(max-min+1)
 	}
 	time.Sleep(time.Duration(d) * time.Millisecond)
 }
 
-func randomByte() byte {
+func randByte() byte {
 	b := make([]byte, 1)
 	_, _ = rand.Read(b)
 	return b[0]

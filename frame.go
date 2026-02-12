@@ -11,6 +11,7 @@ const (
 	FramePing  = 0x02
 	FramePong  = 0x03
 	FrameClose = 0x04
+	FrameOpen  = 0x05 // payload: target string
 )
 
 type Frame struct {
@@ -21,45 +22,38 @@ type Frame struct {
 }
 
 func WriteFrame(w io.Writer, fr *Frame) error {
-	header := make([]byte, 9)
-	binary.BigEndian.PutUint32(header[0:4], fr.StreamID)
-	header[4] = fr.Type
-	binary.BigEndian.PutUint32(header[5:9], fr.Length)
-
-	_, err := w.Write(header)
-	if err != nil {
+	if fr == nil {
+		return errors.New("nil frame")
+	}
+	h := make([]byte, 9)
+	binary.BigEndian.PutUint32(h[0:4], fr.StreamID)
+	h[4] = fr.Type
+	binary.BigEndian.PutUint32(h[5:9], uint32(len(fr.Payload)))
+	if _, err := w.Write(h); err != nil {
 		return err
 	}
-
-	if fr.Length > 0 && fr.Payload != nil {
-		_, err = w.Write(fr.Payload)
+	if len(fr.Payload) > 0 {
+		_, err := w.Write(fr.Payload)
+		return err
 	}
-	return err
+	return nil
 }
 
 func ReadFrame(r io.Reader) (*Frame, error) {
-	header := make([]byte, 9)
-	_, err := io.ReadFull(r, header)
-	if err != nil {
+	h := make([]byte, 9)
+	if _, err := io.ReadFull(r, h); err != nil {
 		return nil, err
 	}
+	sid := binary.BigEndian.Uint32(h[0:4])
+	ft := h[4]
+	l := binary.BigEndian.Uint32(h[5:9])
 
-	streamID := binary.BigEndian.Uint32(header[0:4])
-	frameType := header[4]
-	length := binary.BigEndian.Uint32(header[5:9])
-
-	payload := make([]byte, length)
-	if length > 0 {
-		_, err = io.ReadFull(r, payload)
-		if err != nil {
+	var p []byte
+	if l > 0 {
+		p = make([]byte, l)
+		if _, err := io.ReadFull(r, p); err != nil {
 			return nil, err
 		}
 	}
-
-	return &Frame{
-		StreamID: streamID,
-		Type:     frameType,
-		Length:   length,
-		Payload:  payload,
-	}, nil
+	return &Frame{StreamID: sid, Type: ft, Length: l, Payload: p}, nil
 }

@@ -2,36 +2,53 @@ package httpmux
 
 import (
 	"net/http"
+	"strings"
 )
 
 type MimicConfig struct {
-	FakeDomain      string
-	FakePath        string
-	UserAgent       string
-	CustomHeaders   []string
-	SessionCookie   bool
-	ChunkedEncoding bool
+	FakeDomain    string   `yaml:"fake_domain"`
+	FakePath      string   `yaml:"fake_path"`
+	UserAgent     string   `yaml:"user_agent"`
+	CustomHeaders []string `yaml:"custom_headers"`
+	SessionCookie bool     `yaml:"session_cookie"`
 }
 
 func ApplyMimicHeaders(req *http.Request, cfg *MimicConfig, sessionID string) {
-	req.Host = cfg.FakeDomain
-	req.Header.Set("User-Agent", cfg.UserAgent)
+	// safe defaults
+	req.Header.Set("Accept", "*/*")
+	req.Header.Set("Accept-Language", "en-US,en;q=0.9")
+	req.Header.Set("Cache-Control", "no-cache")
+	req.Header.Set("Pragma", "no-cache")
+	req.Header.Set("Connection", "keep-alive")
 
+	if cfg == nil {
+		req.Header.Set("User-Agent", "Mozilla/5.0")
+		if sessionID != "" {
+			req.Header.Set("Cookie", "SESSION="+sessionID)
+		}
+		return
+	}
+
+	if cfg.UserAgent != "" {
+		req.Header.Set("User-Agent", cfg.UserAgent)
+	} else {
+		req.Header.Set("User-Agent", "Mozilla/5.0")
+	}
+
+	// Custom headers "Key: Value"
 	for _, h := range cfg.CustomHeaders {
-		parts := SplitHeader(h)
-		req.Header.Set(parts[0], parts[1])
-	}
-
-	if cfg.SessionCookie {
-		req.Header.Set("Cookie", "SESSION="+sessionID)
-	}
-}
-
-func SplitHeader(h string) [2]string {
-	for i := 0; i < len(h); i++ {
-		if h[i] == ':' {
-			return [2]string{h[:i], h[i+2:]}
+		parts := strings.SplitN(h, ":", 2)
+		if len(parts) != 2 {
+			continue
+		}
+		k := strings.TrimSpace(parts[0])
+		v := strings.TrimSpace(parts[1])
+		if k != "" && v != "" {
+			req.Header.Set(k, v)
 		}
 	}
-	return [2]string{"Invalid", ""}
+
+	if cfg.SessionCookie && sessionID != "" {
+		req.Header.Set("Cookie", "SESSION="+sessionID)
+	}
 }
