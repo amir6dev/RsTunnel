@@ -5,19 +5,22 @@ import (
 	"log"
 	"net/http"
 	"strings"
-<<<<<<< HEAD
 
-	"github.com/amir6dev/rstunnel/PicoTun"
-=======
-    httpmux "github.com/amir6dev/rstunnel/PicoTun"
->>>>>>> a523b3c (Add GitHub Actions release workflow)
+	httpmux "github.com/amir6dev/rstunnel/PicoTun"
 )
 
 func main() {
+	// Support both -config and -c for compatibility with installer scripts
 	configPath := flag.String("config", "/etc/picotun/config.yaml", "path to config file")
+	configShort := flag.String("c", "", "alias for -config")
 	flag.Parse()
 
-	cfg, err := httpmux.LoadConfig(*configPath)
+	cfgPath := *configPath
+	if *configShort != "" {
+		cfgPath = *configShort
+	}
+
+	cfg, err := httpmux.LoadConfig(cfgPath)
 	if err != nil {
 		log.Fatalf("load config: %v", err)
 	}
@@ -40,7 +43,6 @@ func main() {
 		go srv.StartReverseTCP(bind, target)
 	}
 
-	
 	// Reverse UDP listeners
 	for _, m := range cfg.Forward.UDP {
 		bind, target, ok := splitMap(m)

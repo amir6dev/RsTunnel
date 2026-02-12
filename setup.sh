@@ -1,30 +1,25 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# ============================================================================
-# RsTunnel (picotun) Setup - Dagger-style (Iran-friendly)
-#
-# ✅ Prefers prebuilt tar.gz from GitHub Releases (no Go needed)
-# ✅ Uses GitHub API to detect latest release + correct asset name
-# ✅ Rejects HTML / wrong content downloads
-# ✅ Verifies ELF architecture after install
-# ✅ Dependency detection (no reinstall if already present)
-# ============================================================================
+# RsTunnel installer (Dagger-like UX) - httpmux focused
 
 APP_NAME="RsTunnel"
 BIN_NAME="picotun"
 INSTALL_DIR="/etc/${BIN_NAME}"
 BIN_PATH="/usr/local/bin/${BIN_NAME}"
+VERSION_FILE="${INSTALL_DIR}/.installed_tag"
 SERVICE_SERVER="${BIN_NAME}-server"
 SERVICE_CLIENT="${BIN_NAME}-client"
 
 REPO_OWNER="amir6dev"
 REPO_NAME="RsTunnel"
-REPO_URL_DEFAULT="https://github.com/${REPO_OWNER}/${REPO_NAME}.git"
-REPO_BRANCH_DEFAULT="main"
 
-# Mirrors/proxies (best-effort) – for Iran connectivity
-# We'll use these as prefixes for full URLs
+# Prefer release assets (so we DON'T need Go on Iranian servers)
+# Expected asset name pattern (must exist in GitHub Releases):
+#   picotun_linux_amd64.tar.gz
+#   picotun_linux_arm64.tar.gz
+#
+# Each tar.gz should contain a single executable named "picotun".
 DL_PREFIXES=(
   ""  # direct
   "https://ghproxy.com/"
@@ -41,22 +36,13 @@ log()  { echo -e "${COLOR_CYAN}$*${COLOR_RESET}"; }
 ok()   { echo -e "${COLOR_GREEN}✓${COLOR_RESET} $*"; }
 warn() { echo -e "${COLOR_YELLOW}!${COLOR_RESET} $*"; }
 err()  { echo -e "${COLOR_RED}✖${COLOR_RESET} $*"; }
-
 pause() { read -r -p "Press Enter to return..." _; }
 
-need_root() {
-  if [[ "${EUID:-$(id -u)}" -ne 0 ]]; then
-    err "Run as root."
-    exit 1
-  fi
-}
-
+need_root() { [[ "${EUID:-$(id -u)}" -eq 0 ]] || { err "Run as root."; exit 1; }; }
 have_cmd() { command -v "$1" >/dev/null 2>&1; }
 
 detect_arch() {
-  local a
-  a="$(uname -m || true)"
-  case "$a" in
+  case "$(uname -m || true)" in
     x86_64|amd64) echo "amd64" ;;
     aarch64|arm64) echo "arm64" ;;
     *) echo "amd64" ;;
@@ -83,208 +69,240 @@ pkg_install() {
 ensure_deps() {
   log "📦 Checking dependencies..."
   local missing=()
-  for c in curl git tar file; do
+
+  for c in curl tar file; do
     have_cmd "$c" || missing+=("$c")
   done
+  have_cmd git || missing+=("git")
+
   if ((${#missing[@]}==0)); then
     ok "Dependencies already installed"
     return 0
   fi
+
   warn "Installing missing: ${missing[*]}"
   pkg_install "${missing[@]}"
   ok "Dependencies installed"
 }
 
-safe_workdir() { cd / || true; }
-
 curl_try() {
-  # curl_try <url> <out>
   local url="$1" out="$2"
   curl -fL --retry 3 --retry-delay 1 --connect-timeout 10 --max-time 240 "$url" -o "$out"
 }
 
 download_with_prefixes() {
-  # download_with_prefixes <url> <out>
   local url="$1" out="$2"
-  local p u
+  local p full
+  rm -f "$out" >/dev/null 2>&1 || true
   for p in "${DL_PREFIXES[@]}"; do
-    u="${p}${url}"
-    log "   Download: ${u}"
-    if curl_try "$u" "$out"; then
-      return 0
+    full="${p}${url}"
+    if curl_try "$full" "$out" >/dev/null 2>&1; then
+      if [[ -s "$out" ]]; then
+        return 0
+      fi
     fi
-    warn "Failed: ${u}"
+    rm -f "$out" >/dev/null 2>&1 || true
   done
   return 1
 }
 
-github_latest_release_json() {
-  local api="https://api.github.com/repos/${REPO_OWNER}/${REPO_NAME}/releases/latest"
-  # use direct (api usually works) + fallback prefixes
-  local tmp
-  tmp="$(mktemp /tmp/picotun-release.XXXXXX.json)"
-  if ! download_with_prefixes "$api" "$tmp"; then
-    rm -f "$tmp" || true
-    return 1
-  fi
-  cat "$tmp"
-  rm -f "$tmp" || true
-}
-
-extract_json_field() {
-  # very small json extraction without jq, best-effort
-  # extract_json_field <key> reads stdin
-  local key="$1"
-  python3 - "$key" <<'PY' 2>/dev/null || true
-import sys, json
-key=sys.argv[1]
-data=json.load(sys.stdin)
-print(data.get(key,""))
-PY
-}
-
-list_assets() {
-  python3 - <<'PY'
-import sys, json
-data=json.load(sys.stdin)
-for a in data.get("assets",[]):
-    print(a.get("name",""), a.get("browser_download_url",""))
-PY
-}
-
-pick_asset_url() {
-  # pick_asset_url <arch>
-  local arch="$1"
-  local want="picotun_linux_${arch}.tar.gz"
-
-  local json
-  json="$(github_latest_release_json)" || return 1
-
-  local tag
-  tag="$(printf "%s" "$json" | extract_json_field tag_name)"
-  [[ -n "$tag" ]] || tag="latest"
-
-  local url=""
-  while read -r name u; do
-    if [[ "$name" == "$want" ]]; then
-      url="$u"
-      break
-    fi
-  done < <(printf "%s" "$json" | list_assets)
-
-  if [[ -z "$url" ]]; then
-    err "Release asset not found: ${want}"
-    echo "Found assets:"
-    printf "%s" "$json" | list_assets | sed 's/^/  - /'
-    return 1
-  fi
-
-  echo "$url"
-}
-
-is_html_file() {
+is_json_file() {
   local f="$1"
-  file "$f" | grep -qiE 'HTML|text'
-}
-
-is_gzip_file() {
-  local f="$1"
-  file "$f" | grep -qiE 'gzip compressed data'
+  [[ -s "$f" ]] || return 1
+  local first
+  first="$(tr -d '\n\r\t ' <"$f" | head -c 1 || true)"
+  [[ "$first" == "{" || "$first" == "[" ]]
 }
 
 verify_elf_arch() {
-  # verify_elf_arch <bin> <arch>
   local bin="$1" arch="$2"
   local info
   info="$(file "$bin" || true)"
-
   echo "$info" | grep -q "ELF" || { err "Not an ELF binary: $info"; return 1; }
-
   if [[ "$arch" == "amd64" ]]; then
     echo "$info" | grep -qiE "x86-64|x86_64" || { err "Wrong arch (expected amd64): $info"; return 1; }
-  elif [[ "$arch" == "arm64" ]]; then
+  else
     echo "$info" | grep -qiE "aarch64|ARM aarch64" || { err "Wrong arch (expected arm64): $info"; return 1; }
   fi
-  return 0
+}
+
+ask() {
+  local prompt="$1" def="${2:-}"
+  if [[ -n "$def" ]]; then
+    read -r -p "${prompt} [${def}]: " ans
+    echo "${ans:-$def}"
+  else
+    read -r -p "${prompt}: " ans
+    echo "$ans"
+  fi
+}
+
+ask_yn() {
+  local prompt="$1" def="${2:-Y}"
+  local d="$def"
+  local ans
+  read -r -p "${prompt} [${d}]: " ans
+  ans="${ans:-$d}"
+  case "$ans" in
+    y|Y|yes|YES) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+systemd_reload() { systemctl daemon-reload >/dev/null 2>&1 || true; }
+enable_start() {
+  local svc="$1"
+  systemctl enable --now "${svc}.service" >/dev/null 2>&1 || true
+}
+
+stop_disable() {
+  local svc="$1"
+  systemctl disable --now "${svc}.service" >/dev/null 2>&1 || true
+}
+
+get_latest_tag_via_redirect() {
+  local url="https://github.com/${REPO_OWNER}/${REPO_NAME}/releases/latest"
+  local loc p u
+  for p in "${DL_PREFIXES[@]}"; do
+    u="${p}${url}"
+    loc="$(curl -fsSLI "$u" 2>/dev/null | awk -F': ' 'tolower($1)=="location"{print $2}' | tail -n 1 | tr -d '\r')"
+    if [[ -n "$loc" ]]; then
+      echo "$loc" | awk -F'/tag/' '{print $2}' | tr -d '\r'
+      return 0
+    fi
+  done
+  return 1
+}
+
+pick_asset_url_no_api() {
+  local arch="$1" tag="$2"
+  echo "https://github.com/${REPO_OWNER}/${REPO_NAME}/releases/download/${tag}/picotun_linux_${arch}.tar.gz"
+}
+
+read_installed_tag() {
+  [[ -f "$VERSION_FILE" ]] && cat "$VERSION_FILE" || true
+}
+
+write_installed_tag() {
+  local tag="$1"
+  mkdir -p "$INSTALL_DIR"
+  echo -n "$tag" > "$VERSION_FILE"
 }
 
 install_core_from_release() {
   ensure_deps
 
-  local arch
+  local arch tag url
   arch="$(detect_arch)"
   log "⬇️  Installing core for arch: ${arch}"
 
-  local url
-  url="$(pick_asset_url "$arch")" || return 1
-  ok "Using asset: ${url}"
+  tag=""
+  url=""
+
+  local api="https://api.github.com/repos/${REPO_OWNER}/${REPO_NAME}/releases/latest"
+  local jsonf
+  jsonf="$(mktemp /tmp/picotun.release.XXXXXX.json)"
+
+  local have_api=0
+  if download_with_prefixes "$api" "$jsonf" && is_json_file "$jsonf" && have_cmd python3; then
+    have_api=1
+  fi
+
+  if [[ "$have_api" -eq 1 ]]; then
+    tag="$(python3 - <<'PY' <"$jsonf" 2>/dev/null || true
+import json,sys
+try:
+    data=json.load(sys.stdin)
+    print(data.get("tag_name",""))
+except Exception:
+    pass
+PY
+)"
+    url="$(python3 - "$arch" <<'PY' <"$jsonf" 2>/dev/null || true
+import json,sys
+arch=sys.argv[1]
+want=f"picotun_linux_{arch}.tar.gz"
+try:
+    data=json.load(sys.stdin)
+    for a in data.get("assets",[]):
+        if a.get("name","")==want:
+            print(a.get("browser_download_url",""))
+            raise SystemExit(0)
+except Exception:
+    pass
+raise SystemExit(1)
+PY
+)" || true
+  fi
+
+  rm -f "$jsonf" >/dev/null 2>&1 || true
+
+  if [[ -z "$tag" ]]; then
+    tag="$(get_latest_tag_via_redirect || true)"
+  fi
+
+  if [[ -z "$url" ]]; then
+    [[ -n "$tag" ]] || { err "Could not detect latest release tag."; return 1; }
+    url="$(pick_asset_url_no_api "$arch" "$tag")"
+  fi
+
+  local installed
+  installed="$(read_installed_tag)"
+  if [[ -n "$installed" && "$installed" == "$tag" && -x "$BIN_PATH" ]]; then
+    ok "Core already up-to-date (${tag})"
+    return 0
+  fi
 
   local tmpd tgz
   tmpd="$(mktemp -d /tmp/picotun-dl.XXXXXX)"
   tgz="${tmpd}/picotun.tgz"
 
-  log "⬇️  Downloading release tar.gz..."
   if ! download_with_prefixes "$url" "$tgz"; then
     rm -rf "$tmpd" || true
-    err "Failed to download release asset."
+    err "Download failed. URL: $url"
     return 1
   fi
 
-  # basic sanity checks
-  if [[ ! -s "$tgz" ]]; then
+  if ! file "$tgz" | grep -qiE "gzip compressed data"; then
+    warn "Downloaded file is not a gzip archive. (Maybe blocked/proxy HTML?)"
     rm -rf "$tmpd" || true
-    err "Downloaded file is empty."
+    err "Core update failed."
     return 1
   fi
 
-  if is_html_file "$tgz"; then
-    rm -rf "$tmpd" || true
-    err "Downloaded HTML instead of tar.gz (blocked/proxy page)."
-    return 1
-  fi
-
-  if ! is_gzip_file "$tgz"; then
-    warn "Downloaded file is not detected as gzip. file=$(file "$tgz")"
-    # still try to extract, but usually this means it's wrong
-  fi
-
-  log "📦 Extracting..."
   tar -xzf "$tgz" -C "$tmpd"
-
   if [[ ! -f "${tmpd}/${BIN_NAME}" ]]; then
-    # maybe nested
-    local found
-    found="$(find "$tmpd" -maxdepth 3 -type f -name "${BIN_NAME}" | head -n 1 || true)"
-    if [[ -z "$found" ]]; then
-      rm -rf "$tmpd" || true
-      err "Binary '${BIN_NAME}' not found inside tar."
-      return 1
-    fi
-    cp -f "$found" "${tmpd}/${BIN_NAME}"
+    rm -rf "$tmpd" || true
+    err "Archive doesn't contain ${BIN_NAME}"
+    return 1
   fi
 
   chmod +x "${tmpd}/${BIN_NAME}"
+  verify_elf_arch "${tmpd}/${BIN_NAME}" "$arch" || { rm -rf "$tmpd" || true; return 1; }
+
   install -m 0755 "${tmpd}/${BIN_NAME}" "$BIN_PATH"
-
-  if ! verify_elf_arch "$BIN_PATH" "$arch"; then
-    rm -rf "$tmpd" || true
-    err "Installed binary is not compatible with this server."
-    err "Tip: your GitHub Action might be producing wrong arch outputs."
-    return 1
-  fi
-
   rm -rf "$tmpd" || true
-  ok "Core installed: ${BIN_PATH}"
+
+  write_installed_tag "$tag"
+  ok "Core installed: ${BIN_PATH} (${tag})"
   return 0
 }
 
-make_dirs() { mkdir -p "$INSTALL_DIR"; }
+ua_by_choice() {
+  case "$1" in
+    2) echo "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:122.0) Gecko/20100101 Firefox/122.0" ;;
+    3) echo "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36" ;;
+    4) echo "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.1 Safari/605.1.15" ;;
+    5) echo "Mozilla/5.0 (Linux; Android 13; Pixel 7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36" ;;
+    *) echo "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36" ;;
+  esac
+}
 
 write_server_service() {
   local cfg="$1"
-  cat > "/etc/systemd/system/${SERVICE_SERVER}.service" <<EOF
+  cat >"/etc/systemd/system/${SERVICE_SERVER}.service" <<EOF
 [Unit]
-Description=${APP_NAME} Server Service
+Description=${APP_NAME} Reverse Tunnel Server
 After=network.target
 
 [Service]
@@ -305,9 +323,9 @@ EOF
 
 write_client_service() {
   local cfg="$1"
-  cat > "/etc/systemd/system/${SERVICE_CLIENT}.service" <<EOF
+  cat >"/etc/systemd/system/${SERVICE_CLIENT}.service" <<EOF
 [Unit]
-Description=${APP_NAME} Client Service
+Description=${APP_NAME} Reverse Tunnel Client
 After=network.target
 
 [Service]
@@ -326,39 +344,23 @@ WantedBy=multi-user.target
 EOF
 }
 
-systemd_reload() { systemctl daemon-reload; }
-enable_start() { systemctl enable --now "${1}.service"; }
-stop_disable() { systemctl disable --now "${1}.service" 2>/dev/null || true; }
-
-ask() {
-  local prompt="$1" def="${2:-}"
-  local v
-  if [[ -n "$def" ]]; then
-    read -r -p "$prompt [$def]: " v
-    echo "${v:-$def}"
-  else
-    read -r -p "$prompt: " v
-    echo "$v"
+health_check_server() {
+  local port="$1"
+  echo
+  log "🔎 Checking server service & tunnel port..."
+  systemctl is-active --quiet "${SERVICE_SERVER}.service" && ok "Service is active" || warn "Service not active"
+  if have_cmd ss; then
+    ss -lntp | grep -E "[: ]${port}\b" >/dev/null 2>&1 && ok "Listening on port ${port}" || warn "Not listening on port ${port}"
+  elif have_cmd netstat; then
+    netstat -lntp 2>/dev/null | grep -E "[:.]${port}\b" >/dev/null 2>&1 && ok "Listening on port ${port}" || warn "Not listening on port ${port}"
   fi
+  curl -fsS "http://127.0.0.1:${port}/tunnel" >/dev/null 2>&1 && ok "HTTP endpoint responds" || warn "HTTP endpoint probe failed (may still be OK if it expects framed traffic)"
 }
 
-ask_yn() {
-  local prompt="$1" def="${2:-Y}"
-  local v
-  read -r -p "$prompt [${def}/n]: " v
-  v="${v:-$def}"
-  [[ "$v" =~ ^[Yy]$ ]]
-}
-
-ua_by_choice() {
-  case "$1" in
-    1) echo "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36" ;;
-    2) echo "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:122.0) Gecko/20100101 Firefox/122.0" ;;
-    3) echo "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36" ;;
-    4) echo "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.2 Safari/605.1.15" ;;
-    5) echo "Mozilla/5.0 (Linux; Android 13; Pixel 7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36" ;;
-    *) echo "Mozilla/5.0" ;;
-  esac
+health_check_client() {
+  echo
+  log "🔎 Checking client service..."
+  systemctl is-active --quiet "${SERVICE_CLIENT}.service" && ok "Service is active" || warn "Service not active"
 }
 
 install_server_flow() {
@@ -410,6 +412,12 @@ install_server_flow() {
     idx=$((idx+1))
   done
 
+  echo
+  echo "═══════════════════════════════════════"
+  echo "      HTTP MIMICRY SETTINGS"
+  echo "═══════════════════════════════════════"
+  echo
+
   local fake_domain fake_path ua uac chunked session_cookie
   fake_domain="$(ask "Fake domain (e.g., www.google.com)" "www.google.com")"
   fake_path="$(ask "Fake path (e.g., /search)" "/search")"
@@ -429,16 +437,17 @@ install_server_flow() {
     ua="$(ua_by_choice "$uac")"
   fi
 
-  if ask_yn "Enable session cookies?" "Y"; then session_cookie="true"; else session_cookie="false"; fi
   if ask_yn "Enable chunked encoding?" "n"; then chunked="true"; else chunked="false"; fi
+  if ask_yn "Enable session cookies?" "Y"; then session_cookie="true"; else session_cookie="false"; fi
 
   if ! install_core_from_release; then
     pause
     return
   fi
 
-  make_dirs
+  mkdir -p "$INSTALL_DIR"
   local cfg="${INSTALL_DIR}/server.yaml"
+
   {
     echo "mode: \"server\""
     echo "listen: \"0.0.0.0:${tunnel_port}\""
@@ -451,10 +460,19 @@ install_server_flow() {
     echo
     echo "maps:"
     for m in "${maps[@]}"; do
-      IFS='|' read -r mtype mbind mtarget <<<"$m"
-      echo "  - type: ${mtype}"
-      echo "    bind: \"${mbind}\""
-      echo "    target: \"${mtarget}\""
+      IFS='|' read -r proto bind target <<<"$m"
+      if [[ "$proto" == "both" ]]; then
+        echo "  - type: tcp"
+        echo "    bind: \"${bind}\""
+        echo "    target: \"${target}\""
+        echo "  - type: udp"
+        echo "    bind: \"${bind}\""
+        echo "    target: \"${target}\""
+      else
+        echo "  - type: ${proto}"
+        echo "    bind: \"${bind}\""
+        echo "    target: \"${target}\""
+      fi
     done
     echo
     echo "obfuscation:"
@@ -480,35 +498,44 @@ install_server_flow() {
   systemd_reload
   enable_start "$SERVICE_SERVER"
 
+  ok "Systemd service for Server created: ${SERVICE_SERVER}.service"
   echo
-  ok "Server configured"
+  echo "═══════════════════════════════════════"
+  echo "   ✓ Server configured"
+  echo "═══════════════════════════════════════"
+  echo
+  echo "  Tunnel Port: ${tunnel_port}"
+  echo "  PSK: ${psk}"
+  echo "  Transport: ${transport}"
   echo "  Config: ${cfg}"
-  echo "  Logs: journalctl -u ${SERVICE_SERVER} -f"
-  echo
+
+  if ask_yn "Check tunnel/service now?" "Y"; then
+    health_check_server "$tunnel_port"
+  fi
+
   pause
 }
 
 install_client_flow() {
   clear
   echo "═══════════════════════════════════════"
-  echo "         CLIENT CONFIGURATION"
+  echo "      CLIENT CONFIGURATION"
   echo "═══════════════════════════════════════"
   echo
 
-  local psk profile obfs_enabled verbose
+  local psk
   psk="$(ask "Enter PSK (must match server)" "")"
 
   echo
   echo "Select Performance Profile:"
-  echo "  1) balanced"
-  echo "  2) aggressive"
-  echo "  3) latency"
-  echo "  4) cpu-efficient"
-  echo "  5) gaming"
-  local pchoice
-  pchoice="$(ask "Choice [1-5]" "1")"
-  case "$pchoice" in
-    1) profile="balanced" ;;
+  echo "  1) balanced      - Standard balanced performance (Recommended)"
+  echo "  2) aggressive    - High speed, aggressive settings"
+  echo "  3) latency       - Optimized for low latency"
+  echo "  4) cpu-efficient - Low CPU usage"
+  echo "  5) gaming        - Optimized for gaming (low latency + high speed)"
+  local profc profile
+  profc="$(ask "Choice [1-5]" "1")"
+  case "$profc" in
     2) profile="aggressive" ;;
     3) profile="latency" ;;
     4) profile="cpu-efficient" ;;
@@ -516,53 +543,69 @@ install_client_flow() {
     *) profile="balanced" ;;
   esac
 
+  local obfs_enabled
   if ask_yn "Enable Traffic Obfuscation?" "Y"; then obfs_enabled="true"; else obfs_enabled="false"; fi
 
-  local transport addr pool aggressive retry dial_timeout
   echo
+  echo "═══════════════════════════════════════"
+  echo "      CONNECTION PATHS"
+  echo "═══════════════════════════════════════"
+  echo
+
   echo "Select Transport Type:"
-  echo "  1) tcpmux"
-  echo "  2) kcpmux"
-  echo "  3) wsmux"
-  echo "  4) wssmux"
-  echo "  5) httpmux"
-  echo "  6) httpsmux"
-  local tchoice
-  tchoice="$(ask "Choice [1-6]" "5")"
-  case "$tchoice" in
+  echo "  1) tcpmux   - TCP Multiplexing"
+  echo "  2) kcpmux   - KCP Multiplexing (UDP)"
+  echo "  3) wsmux    - WebSocket"
+  echo "  4) wssmux   - WebSocket Secure"
+  echo "  5) httpmux  - HTTP Mimicry"
+  echo "  6) httpsmux - HTTPS Mimicry ⭐"
+  local tc transport
+  tc="$(ask "Choice [1-6]" "5")"
+  case "$tc" in
     1) transport="tcpmux" ;;
     2) transport="kcpmux" ;;
     3) transport="wsmux" ;;
     4) transport="wssmux" ;;
-    5) transport="httpmux" ;;
     6) transport="httpsmux" ;;
     *) transport="httpmux" ;;
   esac
 
+  local addr pool aggressive retry dial_timeout
   addr="$(ask "Server address with Tunnel Port (e.g., 1.2.3.4:4000)" "")"
   pool="$(ask "Connection pool size" "2")"
   if ask_yn "Enable aggressive pool?" "N"; then aggressive="true"; else aggressive="false"; fi
   retry="$(ask "Retry interval (seconds)" "3")"
   dial_timeout="$(ask "Dial timeout (seconds)" "10")"
 
-  local fake_domain fake_path ua uac chunked session_cookie
   echo
-  echo "HTTP MIMICRY SETTINGS"
+  echo "═══════════════════════════════════════"
+  echo "      HTTP MIMICRY SETTINGS"
+  echo "═══════════════════════════════════════"
+  echo
+
+  local fake_domain fake_path ua uac chunked session_cookie
   fake_domain="$(ask "Fake domain (e.g., www.google.com)" "www.google.com")"
   fake_path="$(ask "Fake path (e.g., /search)" "/search")"
 
   echo
   echo "Select User-Agent:"
-  echo "  1) Chrome Windows"
+  echo "  1) Chrome Windows (default)"
   echo "  2) Firefox Windows"
   echo "  3) Chrome macOS"
   echo "  4) Safari macOS"
   echo "  5) Chrome Android"
   echo "  6) Custom"
   uac="$(ask "Choice [1-6]" "1")"
-  if [[ "$uac" == "6" ]]; then ua="$(ask "Enter custom User-Agent" "Mozilla/5.0")"; else ua="$(ua_by_choice "$uac")"; fi
+  if [[ "$uac" == "6" ]]; then
+    ua="$(ask "Enter custom User-Agent" "Mozilla/5.0")"
+  else
+    ua="$(ua_by_choice "$uac")"
+  fi
+
   if ask_yn "Enable chunked encoding?" "Y"; then chunked="true"; else chunked="false"; fi
   if ask_yn "Enable session cookies?" "Y"; then session_cookie="true"; else session_cookie="false"; fi
+
+  local verbose
   if ask_yn "Enable verbose logging?" "N"; then verbose="true"; else verbose="false"; fi
 
   if ! install_core_from_release; then
@@ -570,8 +613,9 @@ install_client_flow() {
     return
   fi
 
-  make_dirs
+  mkdir -p "$INSTALL_DIR"
   local cfg="${INSTALL_DIR}/client.yaml"
+
   {
     echo "mode: \"client\""
     echo "psk: \"${psk}\""
@@ -609,11 +653,14 @@ install_client_flow() {
   systemd_reload
   enable_start "$SERVICE_CLIENT"
 
-  echo
   ok "Client configured"
   echo "  Config: ${cfg}"
   echo "  Logs: journalctl -u ${SERVICE_CLIENT} -f"
-  echo
+
+  if ask_yn "Check service now?" "Y"; then
+    health_check_client
+  fi
+
   pause
 }
 
@@ -651,6 +698,7 @@ settings_menu() {
         echo "Server cfg: ${INSTALL_DIR}/server.yaml"
         echo "Client cfg: ${INSTALL_DIR}/client.yaml"
         echo "Binary: ${BIN_PATH}"
+        echo "Installed tag: $(read_installed_tag)"
         pause
         ;;
       0) return ;;
@@ -675,7 +723,7 @@ uninstall_all() {
   stop_disable "$SERVICE_SERVER"
   stop_disable "$SERVICE_CLIENT"
   rm -f "/etc/systemd/system/${SERVICE_SERVER}.service" "/etc/systemd/system/${SERVICE_CLIENT}.service" || true
-  systemctl daemon-reload || true
+  systemd_reload
 
   rm -rf "$INSTALL_DIR" || true
   rm -f "$BIN_PATH" || true
@@ -690,7 +738,7 @@ main_menu() {
     echo "  1) Install Server"
     echo "  2) Install Client"
     echo "  3) Settings (Manage Services & Configs)"
-    echo "  4) Update Core (Download Binary)"
+    echo "  4) Update Core (Re-download Binary)"
     echo "  5) Uninstall"
     echo
     echo "  0) Exit"
