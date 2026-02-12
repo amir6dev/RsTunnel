@@ -1,65 +1,97 @@
 package httpmux
 
 import (
+	"bytes"
 	"io"
 	"net/http"
+	"time"
 )
 
 type Server struct {
 	SessionMgr *SessionManager
-	Mimic      *MimicConfig
 	Obfs       *ObfsConfig
 }
 
-func NewServer(timeout int, mimic *MimicConfig, obfs *ObfsConfig) *Server {
+func NewServer(timeoutSec int, obfs *ObfsConfig) *Server {
 	return &Server{
-		SessionMgr: NewSessionManager(time.Duration(timeout) * time.Second),
-		Mimic:      mimic,
+		SessionMgr: NewSessionManager(time.Duration(timeoutSec) * time.Second),
 		Obfs:       obfs,
 	}
 }
 
 func (s *Server) HandleHTTP(w http.ResponseWriter, r *http.Request) {
 	sessionID := extractSessionID(r)
-	sess := s.SessionMgr.Get(sessionID)
-	if sess == nil {
-		sess = s.SessionMgr.Create(sessionID)
+	// اگر کوکی نبود، ستش کن که بعداً ثابت بمونه
+	_, err := r.Cookie("SESSION")
+	if err != nil {
+		http.SetCookie(w, &http.Cookie{
+			Name:  "SESSION",
+			Value: sessionID,
+			Path:  "/",
+		})
 	}
 
-	data, _ := io.ReadAll(r.Body)
-	r.Body.Close()
+	sess := s.SessionMgr.GetOrCreate(sessionID)
 
-	data = stripObfs(data, s.Obfs)
+	reqBody, _ := io.ReadAll(r.Body)
+	_ = r.Body.Close()
+	reqBody = StripObfuscation(reqBody, s.Obfs)
 
-	reader := bytes.NewReader(data)
+	// incoming frames
+	reader := bytes.NewReader(reqBody)
 	for {
 		fr, err := ReadFrame(reader)
 		if err != nil {
 			break
 		}
-
 		s.handleFrame(sess, fr)
 	}
 
-	out := s.collectOutgoingFrames(sess)
-	w.Write(out)
+	// outgoing frames (drain)
+	var out bytes.Buffer
+	// محدود کن که response خیلی بزرگ نشه
+	max := 128
+	for i := 0; i < max; i++ {
+		select {
+		case fr := <-sess.Outgoing:
+			_ = WriteFrame(&out, fr)
+		default:
+			i = max // break
+		}
+	}
+
+	resp := ApplyObfuscation(out.Bytes(), s.Obfs)
+	ApplyDelay(s.Obfs)
+	_, _ = w.Write(resp)
 }
 
 func (s *Server) handleFrame(sess *Session, fr *Frame) {
-	sess.Mutex.Lock()
-	defer sess.Mutex.Unlock()
-
-	str := sess.Streams[fr.StreamID]
-	if str == nil {
-		str = NewStream(fr.StreamID, nil)
-		sess.Streams[fr.StreamID] = str
-	}
-
+	// اینجا فعلاً فقط برای تست: Echo
+	// بعداً همینجا forwardTCP واقعی رو می‌چسبونیم (مرحله بعد)
 	switch fr.Type {
+	case FramePing:
+		select {
+		case sess.Outgoing <- &Frame{StreamID: 0, Type: FramePong}:
+		default:
+		}
+
 	case FrameData:
-		go forwardTCP(str, fr.Payload)
+		// echo back
+		select {
+		case sess.Outgoing <- &Frame{
+			StreamID: fr.StreamID,
+			Type:     FrameData,
+			Length:   uint32(len(fr.Payload)),
+			Payload:  fr.Payload,
+		}:
+		default:
+		}
+
 	case FrameClose:
-		str.shutdown()
+		select {
+		case sess.Outgoing <- &Frame{StreamID: fr.StreamID, Type: FrameClose}:
+		default:
+		}
 	}
 }
 

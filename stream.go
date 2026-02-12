@@ -1,37 +1,47 @@
 package httpmux
 
 import (
+	"bytes"
 	"errors"
 	"io"
 	"sync"
 )
 
 type Stream struct {
-	ID       uint32
-	in       chan []byte
-	out      chan []byte
+	ID  uint32
+	in  chan []byte
+
 	closed   bool
 	mux      *SMUX
 	writeMtx sync.Mutex
+
+	// برای اینکه اگر payload بزرگ‌تر از p بود گم نشه
+	rbuf bytes.Buffer
+	rmu  sync.Mutex
 }
 
 func NewStream(id uint32, mux *SMUX) *Stream {
 	return &Stream{
-		ID:  id,
-		in:  make(chan []byte, 64),
-		out: make(chan []byte, 64),
+		ID: id,
+		in: make(chan []byte, 64),
 		mux: mux,
 	}
 }
 
 func (s *Stream) Read(p []byte) (int, error) {
+	s.rmu.Lock()
+	defer s.rmu.Unlock()
+
+	if s.rbuf.Len() > 0 {
+		return s.rbuf.Read(p)
+	}
+
 	data, ok := <-s.in
 	if !ok {
 		return 0, io.EOF
 	}
-
-	n := copy(p, data)
-	return n, nil
+	_, _ = s.rbuf.Write(data)
+	return s.rbuf.Read(p)
 }
 
 func (s *Stream) Write(p []byte) (int, error) {
@@ -41,15 +51,37 @@ func (s *Stream) Write(p []byte) (int, error) {
 	if s.closed {
 		return 0, errors.New("stream closed")
 	}
-
-	fr := &Frame{
-		StreamID: s.ID,
-		Type:     FrameData,
-		Length:   uint32(len(p)),
-		Payload:  p,
+	if s.mux == nil {
+		return 0, errors.New("no mux attached")
 	}
 
-	return len(p), s.mux.sendFrame(fr)
+	max := s.mux.cfg.MaxFrame
+	if max <= 0 {
+		max = 2048
+	}
+
+	// chunking
+	sent := 0
+	for sent < len(p) {
+		end := sent + max
+		if end > len(p) {
+			end = len(p)
+		}
+		chunk := p[sent:end]
+
+		fr := &Frame{
+			StreamID: s.ID,
+			Type:     FrameData,
+			Length:   uint32(len(chunk)),
+			Payload:  chunk,
+		}
+		if err := s.mux.sendFrame(fr); err != nil {
+			return sent, err
+		}
+		sent = end
+	}
+
+	return len(p), nil
 }
 
 func (s *Stream) Close() error {
@@ -57,13 +89,10 @@ func (s *Stream) Close() error {
 		return nil
 	}
 	s.closed = true
-
-	fr := &Frame{
-		StreamID: s.ID,
-		Type:     FrameClose,
-		Length:   0,
+	if s.mux == nil {
+		return nil
 	}
-	return s.mux.sendFrame(fr)
+	return s.mux.sendFrame(&Frame{StreamID: s.ID, Type: FrameClose})
 }
 
 // internal receive from mux

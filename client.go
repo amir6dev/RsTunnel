@@ -7,6 +7,7 @@ import (
 
 type Client struct {
 	Conns []*HTTPConn
+	Tr    *HTTPMuxTransport
 	Mux   *SMUX
 }
 
@@ -17,7 +18,7 @@ func NewClient(serverURL, sessionID string, mimic *MimicConfig, obfs *ObfsConfig
 	for i := 0; i < pool; i++ {
 		conns[i] = &HTTPConn{
 			Client: &http.Client{
-				Timeout: 20 * time.Second,
+				Timeout: 25 * time.Second,
 			},
 			Mimic:     mimic,
 			Obfs:      obfs,
@@ -26,15 +27,19 @@ func NewClient(serverURL, sessionID string, mimic *MimicConfig, obfs *ObfsConfig
 		}
 	}
 
-	// SMUX با writer = connection اول
-	mux := NewSMUX(nil, conns[0], SMUXConfig{
-		KeepAlive:   2 * time.Second,
-		MaxStreams:  512,
-		MaxFrame:    2048,
-		ReadTimeout: 30 * time.Second,
+	tr := NewHTTPMuxTransport(conns, HTTPMuxConfig{
+		FlushInterval: 30 * time.Millisecond,
+		MaxBatch:      64,
+		IdlePoll:      250 * time.Millisecond,
 	})
 
-	return &Client{Conns: conns, Mux: mux}
+	mux := NewSMUX(tr, SMUXConfig{
+		KeepAlive:  2 * time.Second,
+		MaxStreams: 512,
+		MaxFrame:   2048,
+	}, true)
+
+	return &Client{Conns: conns, Tr: tr, Mux: mux}
 }
 
 func (c *Client) DialStream() (*Stream, error) {
