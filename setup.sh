@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
-set -euo pipefail
+# set -e removed to handle errors manually and avoid abrupt exits
+# set -euo pipefail 
 
 # ============================================================================
-#  RsTunnel / PicoTun Manager (Fixed & Optimized)
+#  RsTunnel / PicoTun Manager (Full Dagger-Style Automation)
 # ============================================================================
 
 # Colors
@@ -40,7 +41,7 @@ banner() {
     echo -e "${CYAN}"
     echo -e "${GREEN}*** RsTunnel / PicoTun  ***${NC}"
     echo -e "${BLUE}_____________________________${NC}"
-    echo -e "${PURPLE}  Dagger-Style Wizard (Fixed)   ${NC}"
+    echo -e "${PURPLE}   Automation like Dagger    ${NC}"
     echo -e "${BLUE}_____________________________${NC}"
     echo -e "${GREEN}*** Private Tunneling   ***${NC}"
     echo ""
@@ -49,7 +50,7 @@ banner() {
 pause() { read -r -p "Press Enter to continue..."; }
 
 # ----------------------------------------------------------------------------
-#  CORE INSTALLATION (Iran Optimized)
+#  CORE INSTALLATION (Iran Optimized & Retry Logic)
 # ----------------------------------------------------------------------------
 ensure_deps() {
     echo -e "${YELLOW}📦 Installing dependencies...${NC}"
@@ -59,13 +60,13 @@ ensure_deps() {
     elif command -v yum &>/dev/null; then
         yum install -y curl wget git tar openssl iproute2 >/dev/null 2>&1
     else
-        die "Unsupported package manager"
+        echo "Unsupported package manager. Please install dependencies manually."
     fi
     ok "Dependencies installed"
 }
 
 install_go() {
-    # تنظیمات پروکسی برای ایران
+    # Iran Proxy Settings
     export GOPROXY=https://goproxy.cn,direct
     export GOTOOLCHAIN=local
     export GOSUMDB=off
@@ -81,11 +82,31 @@ install_go() {
     local url="https://mirrors.aliyun.com/golang/go${GO_VER}.linux-amd64.tar.gz"
 
     rm -rf /usr/local/go
-    curl -fsSL -L "$url" -o /tmp/go.tgz || die "Go download failed."
+    if ! curl -fsSL -L "$url" -o /tmp/go.tgz; then
+        warn "Failed to download Go. Checking internet..."
+        return 1
+    fi
     tar -C /usr/local -xzf /tmp/go.tgz
     rm -f /tmp/go.tgz
     export PATH="/usr/local/go/bin:${PATH}"
     ok "Go environment ready."
+}
+
+# Retry helper
+go_get_retry() {
+    local PKG=$1
+    local MAX_RETRIES=3
+    local COUNT=0
+    
+    while [ $COUNT -lt $MAX_RETRIES ]; do
+        echo "   Downloading $PKG (Attempt $((COUNT+1)))..."
+        if go get "$PKG"; then
+            return 0
+        fi
+        COUNT=$((COUNT+1))
+        sleep 1
+    done
+    return 1
 }
 
 update_core() {
@@ -101,15 +122,10 @@ update_core() {
     cd "$HOME_DIR"
     rm -rf "$BUILD_DIR"
 
-    if [[ -f "${SCRIPT_DIR}/cmd/server/main.go" || -f "${SCRIPT_DIR}/cmd/client/main.go" ]]; then
-        echo -e "${YELLOW}📁 Using local source (current directory) ...${NC}"
-        mkdir -p "$BUILD_DIR"
-        rsync -a --delete \
-          --exclude ".git" --exclude "bin" --exclude "dist" --exclude "node_modules" \
-          "${SCRIPT_DIR}/" "$BUILD_DIR/" >/dev/null 2>&1 || cp -a "${SCRIPT_DIR}/." "$BUILD_DIR/"
-    else
-        echo -e "${YELLOW}🌐 Cloning from GitHub ...${NC}"
-        git clone --depth 1 "$REPO_URL" "$BUILD_DIR" >/dev/null
+    # Clone
+    echo -e "${YELLOW}🌐 Cloning from GitHub ...${NC}"
+    if ! git clone --depth 1 "$REPO_URL" "$BUILD_DIR"; then
+        die "Failed to clone repository."
     fi
 
     cd "$BUILD_DIR"
@@ -118,13 +134,16 @@ update_core() {
     rm -f go.mod go.sum
     go mod init github.com/amir6dev/rstunnel >/dev/null 2>&1 || true
 
+    # Fix imports
     find . -name "*.go" -type f -exec sed -i 's|github.com/amir6dev/RsTunnel/PicoTun|github.com/amir6dev/rstunnel/PicoTun|g' {} +
     find . -name "*.go" -type f -exec sed -i 's|github.com/amir6dev/RsTunnel|github.com/amir6dev/rstunnel|g' {} +
 
-    go get golang.org/x/net@v0.23.0 >/dev/null 2>&1
-    go get github.com/refraction-networking/utls@v1.6.0 >/dev/null 2>&1
-    go get github.com/xtaci/smux@v1.5.24 >/dev/null 2>&1
-    go get gopkg.in/yaml.v3@v3.0.1 >/dev/null 2>&1
+    echo -e "${YELLOW}📦 Downloading Libraries...${NC}"
+    go_get_retry "golang.org/x/net@v0.23.0" || die "Failed to download x/net"
+    go_get_retry "github.com/refraction-networking/utls@v1.6.0" || die "Failed to download utls"
+    go_get_retry "github.com/xtaci/smux@v1.5.24" || die "Failed to download smux"
+    go_get_retry "gopkg.in/yaml.v3@v3.0.1" || die "Failed to download yaml"
+    
     go mod tidy >/dev/null 2>&1
 
     echo -e "${YELLOW}🔨 Building binary...${NC}"
@@ -211,9 +230,11 @@ ask_mimic() {
 
     read -r -p "Fake Path (for ServerURL) [/tunnel]: " FAKE_PATH
     FAKE_PATH=${FAKE_PATH:-/tunnel}
+    
+    # Force /tunnel for compatibility if needed, or allow it
     if [[ "$FAKE_PATH" != "/tunnel" ]]; then
-        warn "Path reset to /tunnel (hardcoded in this version)."
-        FAKE_PATH="/tunnel"
+        # warn "Using path: $FAKE_PATH"
+        : # no-op
     fi
 
     read -r -p "User-Agent [Mozilla/5.0]: " USER_AGENT
@@ -225,25 +246,24 @@ ask_mimic() {
     CUSTOM_HEADERS_YAML=""
     echo ""
     echo -e "${YELLOW}Custom Headers (Optional)${NC}"
-    echo -e "${YELLOW}Example: X-Forwarded-For: 1.2.3.4${NC}"
     while true; do
         read -r -p "Add custom header? [y/N]: " yn
         [[ ! "$yn" =~ ^[Yy] ]] && break
         read -r -p "  Header (Key: Value): " hdr
-        hdr="$(echo "$hdr" | sed 's/^ *//;s/ *$//')"
-        if [[ -z "$hdr" || "$hdr" != *:* ]]; then
-            warn "Invalid header format. Skipping."
-            continue
+        if [[ -n "$hdr" ]]; then
+            # Safe append
+            CUSTOM_HEADERS_YAML="${CUSTOM_HEADERS_YAML}    - \"${hdr}\"\n"
+            ok "Added header: $hdr"
         fi
-        CUSTOM_HEADERS_YAML="${CUSTOM_HEADERS_YAML}    - "${hdr}"
-"
-        ok "Added header: $hdr"
     done
 
     if [[ -z "$CUSTOM_HEADERS_YAML" ]]; then
         CUSTOM_HEADERS_BLOCK="  custom_headers: []"
     else
-        CUSTOM_HEADERS_BLOCK=$'  custom_headers:\n'"${CUSTOM_HEADERS_YAML%\n}"
+        # We need to construct the block carefully
+        # Remove the last newline using printf inside var
+        CUSTOM_HEADERS_BLOCK="  custom_headers:
+$(printf "%b" "$CUSTOM_HEADERS_YAML")"
     fi
 }
 
@@ -297,17 +317,17 @@ build_port_mappings_tcp() {
         if [[ "$PORT_INPUT" =~ ^([0-9]+)/([0-9]+)$ ]]; then
             START_PORT="${BASH_REMATCH[1]}"; END_PORT="${BASH_REMATCH[2]}"
             for ((p=START_PORT; p<=END_PORT; p++)); do
-                MAPPINGS_TCP_YAML+=$'    - "'"${BIND_IP}:${p}->${TARGET_IP}:${p}"$'"\n'
+                MAPPINGS_TCP_YAML="${MAPPINGS_TCP_YAML}    - \"${BIND_IP}:${p}->${TARGET_IP}:${p}\"\n"
                 COUNT=$((COUNT + 1))
             done
             ok "Added range ${START_PORT}-${END_PORT}"
         elif [[ "$PORT_INPUT" =~ ^([0-9]+)$ ]]; then
             BP="${BASH_REMATCH[1]}"
-            MAPPINGS_TCP_YAML+=$'    - "'"${BIND_IP}:${BP}->${TARGET_IP}:${BP}"$'"\n'
+            MAPPINGS_TCP_YAML="${MAPPINGS_TCP_YAML}    - \"${BIND_IP}:${BP}->${TARGET_IP}:${BP}\"\n"
             COUNT=$((COUNT + 1))
             ok "Added port ${BP}"
         else
-            warn "Invalid format. Use single port (80) or range (80/90)."
+            warn "Invalid format."
         fi
     done
     ok "Total TCP mappings: $COUNT"
@@ -336,35 +356,41 @@ build_port_mappings_udp() {
 
         if [[ "$PORT_INPUT" =~ ^([0-9]+)$ ]]; then
             BP="${BASH_REMATCH[1]}"
-            MAPPINGS_UDP_YAML+=$'    - "'"${BIND_IP_UDP}:${BP}->${TARGET_IP_UDP}:${BP}"$'"\n'
+            MAPPINGS_UDP_YAML="${MAPPINGS_UDP_YAML}    - \"${BIND_IP_UDP}:${BP}->${TARGET_IP_UDP}:${BP}\"\n"
             COUNT_UDP=$((COUNT_UDP + 1))
             ok "Added UDP port ${BP}"
         else
-            warn "Invalid format. Use single port."
+            warn "Invalid format."
         fi
     done
     ok "Total UDP mappings: $COUNT_UDP"
 }
 
 # ----------------------------------------------------------------------------
-#  Config Writers (FIXED: No syntax error here)
+#  Config Writers (Corrected to avoid heredoc syntax errors)
 # ----------------------------------------------------------------------------
 write_server_config() {
     mkdir -p "$CONFIG_DIR"
     
-    # Prepare variables OUTSIDE the heredoc to avoid $() syntax errors
-    local TCP_VAL=" []"
+    # Process the mappings BEFORE the heredoc to ensure clean variables
+    local TCP_BLOCK=" []"
     if [[ -n "${MAPPINGS_TCP_YAML:-}" ]]; then
-        TCP_VAL="
-${MAPPINGS_TCP_YAML}"
+        # Use printf to format the string properly
+        local FORMATTED_TCP
+        FORMATTED_TCP=$(printf "%b" "$MAPPINGS_TCP_YAML")
+        TCP_BLOCK="
+${FORMATTED_TCP}"
     fi
 
-    local UDP_VAL=" []"
+    local UDP_BLOCK=" []"
     if [[ -n "${MAPPINGS_UDP_YAML:-}" ]]; then
-        UDP_VAL="
-${MAPPINGS_UDP_YAML}"
+        local FORMATTED_UDP
+        FORMATTED_UDP=$(printf "%b" "$MAPPINGS_UDP_YAML")
+        UDP_BLOCK="
+${FORMATTED_UDP}"
     fi
 
+    # Write the file
     cat > "$CONFIG_DIR/server.yaml" <<EOF
 mode: "server"
 listen: "${LISTEN_ADDR}"
@@ -386,18 +412,20 @@ obfs:
   max_delay: ${MAX_DELAY}
 
 forward:
-  tcp:${TCP_VAL}
-  udp:${UDP_VAL}
+  tcp:${TCP_BLOCK}
+  udp:${UDP_BLOCK}
 EOF
 }
 
 write_client_config() {
     mkdir -p "$CONFIG_DIR"
     
-    local UDP_VAL=" []"
+    local UDP_BLOCK=" []"
     if [[ -n "${MAPPINGS_UDP_YAML:-}" ]]; then
-        UDP_VAL="
-${MAPPINGS_UDP_YAML}"
+        local FORMATTED_UDP
+        FORMATTED_UDP=$(printf "%b" "$MAPPINGS_UDP_YAML")
+        UDP_BLOCK="
+${FORMATTED_UDP}"
     fi
 
     cat > "$CONFIG_DIR/client.yaml" <<EOF
@@ -422,7 +450,7 @@ obfs:
 
 forward:
   tcp: []
-  udp:${UDP_VAL}
+  udp:${UDP_BLOCK}
 EOF
 }
 
@@ -495,7 +523,7 @@ configure_server() {
     read -r -p "Select Reverse Mode [1]: " REV_MODE
     REV_MODE=${REV_MODE:-1}
 
-    # Clear previous vars
+    # Reset mapping vars
     MAPPINGS_TCP_YAML=""
     MAPPINGS_UDP_YAML=""
 
@@ -544,8 +572,10 @@ configure_client() {
     ask_mimic
     ask_obfs
     
-    # Init vars
     MAPPINGS_UDP_YAML=""
+    # Client usually doesn't need reverse listener setup via wizard in same way, 
+    # but structure supports it if needed. For now, basic config.
+    
     write_client_config
     create_service "client"
     systemctl restart picotun-client || true
