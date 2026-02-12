@@ -128,14 +128,19 @@ update_core() {
     ensure_deps
     install_go
 
+    # If our current working dir was deleted (common when rerunning), recover safely
+    cd / || true
+
     export PATH="/usr/local/go/bin:${PATH}"
     export GOPROXY=https://goproxy.cn,direct
     export GOTOOLCHAIN=local
     export GOSUMDB=off
 
     echo -e "${YELLOW}⬇️  Preparing source code...${NC}"
-    cd "$HOME_DIR"
-    rm -rf "$BUILD_DIR"
+
+    # Use a unique build dir to avoid getcwd issues and parallel runs
+    BUILD_DIR="$(mktemp -d /tmp/picobuild.XXXXXX)"
+    trap 'rm -rf "$BUILD_DIR" >/dev/null 2>&1 || true' RETURN
 
     # Clone
     echo -e "${YELLOW}🌐 Cloning from GitHub ...${NC}"
@@ -143,38 +148,29 @@ update_core() {
         die "Failed to clone repository."
     fi
 
-	cd "$BUILD_DIR"
-	echo -e "${YELLOW}🔧 Fixing build environment (Iran Safe)...${NC}"
+    cd "$BUILD_DIR" || die "Cannot enter build dir"
 
-	# Keep project's go.mod (do NOT delete it). Only normalize module/import casing.
-	if [[ -f go.mod ]]; then
-		sed -i 's|^module github.com/amir6dev/RsTunnel/PicoTun$|module github.com/amir6dev/rstunnel/PicoTun|g' go.mod || true
-	fi
+    echo -e "${YELLOW}🔧 Fixing build environment (Iran Safe)...${NC}"
 
-	# Fix imports (GitHub repo is case-insensitive, but Go modules are case-sensitive)
-	find . -name "*.go" -type f -exec sed -i 's|github.com/amir6dev/RsTunnel/PicoTun|github.com/amir6dev/rstunnel/PicoTun|g' {} +
-	find . -name "*.go" -type f -exec sed -i 's|github.com/amir6dev/RsTunnel|github.com/amir6dev/rstunnel|g' {} +
+    # Keep project's go.mod (do NOT delete it). Only normalize module/import casing if needed.
+    if [[ -f go.mod ]]; then
+        sed -i 's|^module github.com/amir6dev/RsTunnel/PicoTun$|module github.com/amir6dev/rstunnel/PicoTun|g' go.mod || true
+        sed -i 's|github.com/amir6dev/RsTunnel/PicoTun|github.com/amir6dev/rstunnel/PicoTun|g' -R . 2>/dev/null || true
+    fi
 
     echo -e "${YELLOW}📦 Downloading Libraries...${NC}"
-    go_get_retry "golang.org/x/net@v0.23.0" || die "Failed to download x/net"
-    go_get_retry "github.com/refraction-networking/utls@v1.6.0" || die "Failed to download utls"
-    go_get_retry "github.com/xtaci/smux@v1.5.24" || die "Failed to download smux"
-    go_get_retry "gopkg.in/yaml.v3@v3.0.1" || die "Failed to download yaml"
-    
-    go mod tidy >/dev/null 2>&1
+    go mod tidy >/dev/null 2>&1 || true
+    go mod download >/dev/null 2>&1 || true
 
-	echo -e "${YELLOW}🔨 Building binary...${NC}"
-	if [[ -d "cmd/picotun" ]]; then
-		CGO_ENABLED=0 go build -trimpath -o picotun ./cmd/picotun || die "Build failed."
-	else
-		CGO_ENABLED=0 go build -trimpath -o picotun ./cmd/picotun/main.go || die "Build failed."
-	fi
-    install -m 0755 picotun "${BIN_PATH}"
-    ok "Core updated successfully: ${BIN_PATH}"
+    echo -e "${YELLOW}🔨 Building binary...${NC}"
+    go build -trimpath -o picotun ./cmd/picotun || die "Build failed."
 
-    cd "$HOME_DIR"
-    rm -rf "$BUILD_DIR"
+    install -m 755 picotun "$BIN_PATH" || die "Cannot install binary"
+    ok "Core updated: $BIN_PATH"
+
+    # Build dir cleaned by trap
 }
+
 
 # ----------------------------------------------------------------------------
 #  SYSTEM OPTIMIZER (BBR/TCP)
@@ -237,80 +233,91 @@ ask_psk() {
 ask_mimic() {
     echo ""
     echo -e "${CYAN}═══════════════════════════════════════${NC}"
-    echo -e "${CYAN}      HTTP MIMICRY (Headers)           ${NC}"
+    echo -e "${CYAN}      HTTP MIMICRY SETTINGS            ${NC}"
     echo -e "${CYAN}═══════════════════════════════════════${NC}"
     echo ""
 
-    read -r -p "Fake Domain (Host header) [www.google.com]: " FAKE_DOMAIN
+    read -r -p "Fake domain (e.g., www.google.com) [www.google.com]: " FAKE_DOMAIN
     FAKE_DOMAIN=${FAKE_DOMAIN:-www.google.com}
 
-    read -r -p "Fake Path (for ServerURL) [/tunnel]: " FAKE_PATH
-    FAKE_PATH=${FAKE_PATH:-/tunnel}
-    
-    # Force /tunnel for compatibility if needed, or allow it
-    if [[ "$FAKE_PATH" != "/tunnel" ]]; then
-        # warn "Using path: $FAKE_PATH"
-        : # no-op
+    read -r -p "Fake path (e.g., /search) [/search]: " FAKE_PATH
+    FAKE_PATH=${FAKE_PATH:-/search}
+    if [[ ! "$FAKE_PATH" =~ ^/ ]]; then
+        FAKE_PATH="/$FAKE_PATH"
     fi
 
-    read -r -p "User-Agent [Mozilla/5.0]: " USER_AGENT
-    USER_AGENT=${USER_AGENT:-Mozilla/5.0}
+    echo ""
+    echo "Select User-Agent:"
+    echo "  1) Chrome Windows (default)"
+    echo "  2) Firefox Windows"
+    echo "  3) Chrome macOS"
+    echo "  4) Safari macOS"
+    echo "  5) Chrome Android"
+    echo "  6) Custom"
+    read -r -p "Choice [1-6]: " UA_CHOICE
+    UA_CHOICE=${UA_CHOICE:-1}
 
-    read -r -p "Enable Session Cookie header? [Y/n]: " SESSION_COOKIE
+    case "$UA_CHOICE" in
+        1) USER_AGENT='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36' ;;
+        2) USER_AGENT='Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:122.0) Gecko/20100101 Firefox/122.0' ;;
+        3) USER_AGENT='Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36' ;;
+        4) USER_AGENT='Mozilla/5.0 (Macintosh; Intel Mac OS X 13_5) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.6 Safari/605.1.15' ;;
+        5) USER_AGENT='Mozilla/5.0 (Linux; Android 13; Pixel 7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36' ;;
+        6)
+            read -r -p "Enter custom User-Agent: " USER_AGENT
+            USER_AGENT=${USER_AGENT:-Mozilla/5.0}
+            ;;
+        *) USER_AGENT='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36' ;;
+    esac
+
+    read -r -p "Enable chunked encoding? [Y/n]: " CHUNKED_TE
+    if [[ "${CHUNKED_TE}" =~ ^[Nn] ]]; then CHUNKED_BOOL="false"; else CHUNKED_BOOL="true"; fi
+
+    read -r -p "Enable session cookies? [Y/n]: " SESSION_COOKIE
     if [[ "${SESSION_COOKIE}" =~ ^[Nn] ]]; then SESSION_COOKIE_BOOL="false"; else SESSION_COOKIE_BOOL="true"; fi
 
-	read -r -p "Enable Chunked Transfer-Encoding (hide body size)? [y/N]: " CHUNKED_TE
-	if [[ "${CHUNKED_TE}" =~ ^[Yy] ]]; then CHUNKED_BOOL="true"; else CHUNKED_BOOL="false"; fi
+    # Defaults like Dagger
+    CUSTOM_HEADERS_YAML="    - \"X-Requested-With: XMLHttpRequest\"\n    - \"Referer: https://${FAKE_DOMAIN}/\"\n"
 
-    CUSTOM_HEADERS_YAML=""
     echo ""
-    echo -e "${YELLOW}Custom Headers (Optional)${NC}"
-    while true; do
-        read -r -p "Add custom header? [y/N]: " yn
-        [[ ! "$yn" =~ ^[Yy] ]] && break
-        read -r -p "  Header (Key: Value): " hdr
-        if [[ -n "$hdr" ]]; then
-            # Safe append
-            CUSTOM_HEADERS_YAML="${CUSTOM_HEADERS_YAML}    - \"${hdr}\"\n"
-            ok "Added header: $hdr"
-        fi
-    done
-
-    if [[ -z "$CUSTOM_HEADERS_YAML" ]]; then
-        CUSTOM_HEADERS_BLOCK="  custom_headers: []"
-    else
-        # We need to construct the block carefully
-        # Remove the last newline using printf inside var
-        CUSTOM_HEADERS_BLOCK="  custom_headers:
-$(printf "%b" "$CUSTOM_HEADERS_YAML")"
+    read -r -p "Add extra custom headers? [y/N]: " addh
+    if [[ "$addh" =~ ^[Yy] ]]; then
+        while true; do
+            read -r -p "Header (Key: Value) (empty to finish): " HLINE
+            [[ -z "$HLINE" ]] && break
+            CUSTOM_HEADERS_YAML="${CUSTOM_HEADERS_YAML}    - \"${HLINE}\"\n"
+        done
     fi
 }
+
 
 ask_obfs() {
     echo ""
     echo -e "${CYAN}═══════════════════════════════════════${NC}"
-    echo -e "${CYAN}      OBFUSCATION (Padding/Delay)      ${NC}"
+    echo -e "${CYAN}      TRAFFIC OBFUSCATION              ${NC}"
     echo -e "${CYAN}═══════════════════════════════════════${NC}"
     echo ""
 
-    read -r -p "Enable Obfuscation? [Y/n]: " ENABLE_OBFS
+    read -r -p "Enable Traffic Obfuscation? [Y/n]: " ENABLE_OBFS
     if [[ "$ENABLE_OBFS" =~ ^[Nn] ]]; then
         OBFS_BOOL="false"
-        MIN_PAD=16; MAX_PAD=256; MIN_DELAY=0; MAX_DELAY=0
+        MIN_PAD=16; MAX_PAD=512; MIN_DELAY=0; MAX_DELAY=0; BURST_CHANCE=0
         return
     fi
-    OBFS_BOOL="true"
 
+    OBFS_BOOL="true"
     read -r -p "Min Padding bytes [16]: " MIN_PAD
     MIN_PAD=${MIN_PAD:-16}
-    read -r -p "Max Padding bytes [256]: " MAX_PAD
-    MAX_PAD=${MAX_PAD:-256}
-
-    read -r -p "Min Delay (ms) [0]: " MIN_DELAY
-    MIN_DELAY=${MIN_DELAY:-0}
-    read -r -p "Max Delay (ms) [0]: " MAX_DELAY
-    MAX_DELAY=${MAX_DELAY:-0}
+    read -r -p "Max Padding bytes [512]: " MAX_PAD
+    MAX_PAD=${MAX_PAD:-512}
+    read -r -p "Min Delay (ms) [5]: " MIN_DELAY
+    MIN_DELAY=${MIN_DELAY:-5}
+    read -r -p "Max Delay (ms) [50]: " MAX_DELAY
+    MAX_DELAY=${MAX_DELAY:-50}
+    read -r -p "Burst chance (0.00-1.00) [0.15]: " BURST_CHANCE
+    BURST_CHANCE=${BURST_CHANCE:-0.15}
 }
+
 
 build_port_mappings_tcp() {
     echo ""
@@ -390,90 +397,116 @@ build_port_mappings_udp() {
 # ----------------------------------------------------------------------------
 write_server_config() {
     mkdir -p "$CONFIG_DIR"
-    
-    # Process the mappings BEFORE the heredoc to ensure clean variables
-    local TCP_BLOCK=" []"
+
+    local MAPS_BLOCK=""
+    # Convert MAPPINGS_TCP_YAML lines into dagger-style map objects
     if [[ -n "${MAPPINGS_TCP_YAML:-}" ]]; then
-        # Use printf to format the string properly
-        local FORMATTED_TCP
-        FORMATTED_TCP=$(printf "%b" "$MAPPINGS_TCP_YAML")
-        TCP_BLOCK="
-${FORMATTED_TCP}"
+        while IFS= read -r line; do
+            [[ -z "$line" ]] && continue
+            if [[ "$line" =~ \"([^\"]+)\" ]]; then
+                local pair="${BASH_REMATCH[1]}"
+                local bind="${pair%%->*}"
+                local target="${pair##*->}"
+                MAPS_BLOCK="${MAPS_BLOCK}  - type: tcp\n    bind: \"${bind}\"\n    target: \"${target}\"\n"
+            fi
+        done <<< "$(printf "%b" "$MAPPINGS_TCP_YAML")"
     fi
 
-    local UDP_BLOCK=" []"
     if [[ -n "${MAPPINGS_UDP_YAML:-}" ]]; then
-        local FORMATTED_UDP
-        FORMATTED_UDP=$(printf "%b" "$MAPPINGS_UDP_YAML")
-        UDP_BLOCK="
-${FORMATTED_UDP}"
+        while IFS= read -r line; do
+            [[ -z "$line" ]] && continue
+            if [[ "$line" =~ \"([^\"]+)\" ]]; then
+                local pair="${BASH_REMATCH[1]}"
+                local bind="${pair%%->*}"
+                local target="${pair##*->}"
+                MAPS_BLOCK="${MAPS_BLOCK}  - type: udp\n    bind: \"${bind}\"\n    target: \"${target}\"\n"
+            fi
+        done <<< "$(printf "%b" "$MAPPINGS_UDP_YAML")"
     fi
 
-    # Write the file
+    # Always have maps key
+    if [[ -z "$MAPS_BLOCK" ]]; then
+        MAPS_BLOCK="  []"
+    else
+        MAPS_BLOCK="$(printf "%b" "$MAPS_BLOCK")"
+    fi
+
     cat > "$CONFIG_DIR/server.yaml" <<EOF
 mode: "server"
 listen: "${LISTEN_ADDR}"
-session_timeout: ${SESSION_TIMEOUT}
+transport: "httpmux"
 psk: "${PSK}"
+profile: "${PROFILE}"
+verbose: ${VERBOSE}
 
-mimic:
-  fake_domain: "${FAKE_DOMAIN}"
-  fake_path: "${FAKE_PATH}"
-  user_agent: "${USER_AGENT}"
-  session_cookie: ${SESSION_COOKIE_BOOL}
-  chunked: ${CHUNKED_BOOL}
-${CUSTOM_HEADERS_BLOCK}
+heartbeat: ${HEARTBEAT}
 
-obfs:
+maps:
+$(printf "%b" "$MAPS_BLOCK")
+
+advanced:
+  session_timeout: ${SESSION_TIMEOUT}
+
+obfuscation:
   enabled: ${OBFS_BOOL}
   min_padding: ${MIN_PAD}
   max_padding: ${MAX_PAD}
-  min_delay: ${MIN_DELAY}
-  max_delay: ${MAX_DELAY}
+  min_delay_ms: ${MIN_DELAY}
+  max_delay_ms: ${MAX_DELAY}
+  burst_chance: ${BURST_CHANCE}
 
-forward:
-  tcp:${TCP_BLOCK}
-  udp:${UDP_BLOCK}
+http_mimic:
+  fake_domain: "${FAKE_DOMAIN}"
+  fake_path: "${FAKE_PATH}"
+  user_agent: "${USER_AGENT}"
+  chunked_encoding: ${CHUNKED_BOOL}
+  session_cookie: ${SESSION_COOKIE_BOOL}
+  custom_headers:
+$(printf "%b" "${CUSTOM_HEADERS_YAML:-    - \"Accept-Language: en-US,en;q=0.9\"\n    - \"Accept-Encoding: gzip, deflate, br\"\n}")
 EOF
 }
+
 
 write_client_config() {
     mkdir -p "$CONFIG_DIR"
-    
-    local UDP_BLOCK=" []"
-    if [[ -n "${MAPPINGS_UDP_YAML:-}" ]]; then
-        local FORMATTED_UDP
-        FORMATTED_UDP=$(printf "%b" "$MAPPINGS_UDP_YAML")
-        UDP_BLOCK="
-${FORMATTED_UDP}"
-    fi
+
+    # Paths YAML (support multiple later; currently 1)
+    local PATHS_YAML=""
+    PATHS_YAML="${PATHS_YAML}  - transport: \"httpmux\"\n"
+    PATHS_YAML="${PATHS_YAML}    addr: \"${SIP}:${SPORT}\"\n"
+    PATHS_YAML="${PATHS_YAML}    connection_pool: ${POOL_SIZE}\n"
+    PATHS_YAML="${PATHS_YAML}    aggressive_pool: ${AGGRESSIVE_POOL}\n"
+    PATHS_YAML="${PATHS_YAML}    retry_interval: ${RETRY_INTERVAL}\n"
+    PATHS_YAML="${PATHS_YAML}    dial_timeout: ${DIAL_TIMEOUT}\n"
 
     cat > "$CONFIG_DIR/client.yaml" <<EOF
 mode: "client"
-server_url: "http://${SIP}:${SPORT}${FAKE_PATH}"
-session_id: "client-$(openssl rand -hex 4)"
 psk: "${PSK}"
+profile: "${PROFILE}"
+verbose: ${VERBOSE}
 
-mimic:
-  fake_domain: "${FAKE_DOMAIN}"
-  fake_path: "${FAKE_PATH}"
-  user_agent: "${USER_AGENT}"
-  session_cookie: ${SESSION_COOKIE_BOOL}
-  chunked: ${CHUNKED_BOOL}
-${CUSTOM_HEADERS_BLOCK}
+paths:
+$(printf "%b" "$PATHS_YAML")
 
-obfs:
+obfuscation:
   enabled: ${OBFS_BOOL}
   min_padding: ${MIN_PAD}
   max_padding: ${MAX_PAD}
-  min_delay: ${MIN_DELAY}
-  max_delay: ${MAX_DELAY}
+  min_delay_ms: ${MIN_DELAY}
+  max_delay_ms: ${MAX_DELAY}
+  burst_chance: ${BURST_CHANCE}
 
-forward:
-  tcp: []
-  udp:${UDP_BLOCK}
+http_mimic:
+  fake_domain: "${FAKE_DOMAIN}"
+  fake_path: "${FAKE_PATH}"
+  user_agent: "${USER_AGENT}"
+  chunked_encoding: ${CHUNKED_BOOL}
+  session_cookie: ${SESSION_COOKIE_BOOL}
+  custom_headers:
+$(printf "%b" "${CUSTOM_HEADERS_YAML:-    - \"X-Requested-With: XMLHttpRequest\"\n    - \"Referer: https://${FAKE_DOMAIN}/\"\n}")
 EOF
 }
+
 
 # ----------------------------------------------------------------------------
 #  Systemd
@@ -521,92 +554,193 @@ show_logs() {
 configure_server() {
     banner
     echo -e "${CYAN}═══════════════════════════════════════${NC}"
-    echo -e "${CYAN}      SERVER CONFIGURATION (httpmux)   ${NC}"
+    echo -e "${CYAN}      SERVER CONFIGURATION             ${NC}"
     echo -e "${CYAN}═══════════════════════════════════════${NC}"
     echo ""
 
-    read -r -p "Listen IP [0.0.0.0]: " LIP
-    LIP=${LIP:-0.0.0.0}
-    read -r -p "Tunnel Listen Port [1010]: " LPORT
-    LPORT=${LPORT:-1010}
-    LISTEN_ADDR="${LIP}:${LPORT}"
+    read -r -p "Tunnel Port [2020]: " LPORT
+    LPORT=${LPORT:-2020}
+    LISTEN_ADDR="0.0.0.0:${LPORT}"
 
-    ask_session_timeout
-    ask_psk
-    ask_mimic
-    ask_obfs
-    
+    read -r -p "Enter PSK (Pre-Shared Key): " PSK
+    [[ -z "${PSK}" ]] && die "PSK is required"
+
     echo ""
-    echo "1) TCP only (recommended)"
-    echo "2) UDP only"
-    echo "3) TCP + UDP"
-    echo "4) None"
-    read -r -p "Select Reverse Mode [1]: " REV_MODE
-    REV_MODE=${REV_MODE:-1}
+    echo "Select Transport:"
+    echo "  1) httpmux   - HTTP Mimicry"
+    read -r -p "Choice [1]: " TR
+    TR=${TR:-1}
 
-    # Reset mapping vars
+    PROFILE="latency"
+    HEARTBEAT=2
+    SESSION_TIMEOUT=15
+
+    read -r -p "Optimize system now? [Y/n]: " opt
+    if [[ ! "$opt" =~ ^[Nn] ]]; then
+        optimize_system || true
+    fi
+
+    # Port mappings like Dagger
     MAPPINGS_TCP_YAML=""
     MAPPINGS_UDP_YAML=""
 
-    case "$REV_MODE" in
-        1) build_port_mappings_tcp ;;
-        2) build_port_mappings_udp ;;
-        3) build_port_mappings_tcp; build_port_mappings_udp ;;
-        4) warn "No reverse listeners will be created." ;;
-        *) warn "Invalid choice, defaulting to TCP only."; build_port_mappings_tcp ;;
-    esac
+    echo ""
+    echo -e "${CYAN}PORT MAPPINGS${NC}"
+    COUNT=0
+    while true; do
+        echo ""
+        echo "Port Mapping #$((COUNT+1))"
+        read -r -p "Bind Port (port on this server, e.g., 2222): " BPORT
+        [[ -z "$BPORT" ]] && break
+        read -r -p "Target Port (destination port, e.g., 22): " TPORT
+        [[ -z "$TPORT" ]] && die "Target port required"
+        read -r -p "Protocol (tcp/udp/both) [tcp]: " PROTO
+        PROTO=${PROTO:-tcp}
+        case "$PROTO" in
+            tcp|TCP)
+                MAPPINGS_TCP_YAML="${MAPPINGS_TCP_YAML}    - \"0.0.0.0:${BPORT}->127.0.0.1:${TPORT}\"\n"
+                ok "Mapping added: 0.0.0.0:${BPORT} → 127.0.0.1:${TPORT} (tcp)"
+                ;;
+            udp|UDP)
+                MAPPINGS_UDP_YAML="${MAPPINGS_UDP_YAML}    - \"0.0.0.0:${BPORT}->127.0.0.1:${TPORT}\"\n"
+                ok "Mapping added: 0.0.0.0:${BPORT} → 127.0.0.1:${TPORT} (udp)"
+                ;;
+            both|BOTH)
+                MAPPINGS_TCP_YAML="${MAPPINGS_TCP_YAML}    - \"0.0.0.0:${BPORT}->127.0.0.1:${TPORT}\"\n"
+                MAPPINGS_UDP_YAML="${MAPPINGS_UDP_YAML}    - \"0.0.0.0:${BPORT}->127.0.0.1:${TPORT}\"\n"
+                ok "Mapping added: 0.0.0.0:${BPORT} → 127.0.0.1:${TPORT} (both)"
+                ;;
+            *)
+                warn "Invalid protocol, defaulting to tcp"
+                MAPPINGS_TCP_YAML="${MAPPINGS_TCP_YAML}    - \"0.0.0.0:${BPORT}->127.0.0.1:${TPORT}\"\n"
+                ;;
+        esac
+
+        read -r -p "Add another mapping? [y/N]: " more
+        if [[ ! "$more" =~ ^[Yy] ]]; then
+            break
+        fi
+        COUNT=$((COUNT+1))
+    done
+
+    # Mimic + obfs (server usually no delay)
+    ask_mimic
+    # Server-side default: obfs enabled but delay 0 (similar to Dagger sample)
+    OBFS_BOOL="true"; MIN_PAD=8; MAX_PAD=32; MIN_DELAY=0; MAX_DELAY=0; BURST_CHANCE=0
+
+    read -r -p "Enable verbose logging? [Y/n]: " v
+    if [[ "$v" =~ ^[Nn] ]]; then VERBOSE="false"; else VERBOSE="true"; fi
 
     write_server_config
     create_service "server"
 
-    echo ""
-    echo -e "${GREEN}Configuration Complete!${NC}"
-    echo -e "PSK: ${YELLOW}${PSK}${NC}"
-    echo ""
-    pause
-
     systemctl restart picotun-server || true
-    ok "Server started/restarted."
-    echo ""
-    read -r -p "View live logs now? [y/N]: " yn
-    if [[ "$yn" =~ ^[Yy] ]]; then
-        show_logs "server"
-    fi
+
+    echo -e "${GREEN}═══════════════════════════════════════${NC}"
+    echo -e "  Tunnel Port: ${YELLOW}${LPORT}${NC}"
+    echo -e "  PSK: ${YELLOW}${PSK}${NC}"
+    echo -e "  Transport: ${YELLOW}httpmux${NC}"
+    echo -e "  Config: ${YELLOW}${CONFIG_DIR}/server.yaml${NC}"
+    echo -e "${GREEN}═══════════════════════════════════════${NC}"
+    pause
 }
+
 
 configure_client() {
     banner
     echo -e "${CYAN}═══════════════════════════════════════${NC}"
-    echo -e "${CYAN}      CLIENT CONFIGURATION (httpmux)   ${NC}"
+    echo -e "${CYAN}      CLIENT CONFIGURATION             ${NC}"
     echo -e "${CYAN}═══════════════════════════════════════${NC}"
     echo ""
 
-    read -r -p "Server IP: " SIP
-    [[ -z "${SIP}" ]] && die "Server IP is required"
-    read -r -p "Server Port [1010]: " SPORT
-    SPORT=${SPORT:-1010}
+    echo "Configuration Mode:"
+    echo "  1) Automatic - Optimized settings (Recommended)"
+    echo "  2) Manual - Custom configuration"
+    read -r -p "Choice [1-2]: " CMODE
+    CMODE=${CMODE:-1}
 
-    echo ""
-    read -r -p "Enter PSK (From Server): " PSK
+    read -r -p "Enter PSK (must match server): " PSK
     [[ -z "${PSK}" ]] && die "PSK is required"
 
+    echo ""
+    echo "Select Performance Profile:"
+    echo "  1) balanced      - Standard balanced performance (Recommended)"
+    echo "  2) aggressive    - High speed, aggressive settings"
+    echo "  3) latency       - Optimized for low latency"
+    echo "  4) cpu-efficient - Low CPU usage"
+    echo "  5) gaming        - Optimized for gaming (low latency + high speed)"
+    read -r -p "Choice [1-5]: " PSEL
+    PSEL=${PSEL:-1}
+    case "$PSEL" in
+        1) PROFILE="balanced" ;;
+        2) PROFILE="aggressive" ;;
+        3) PROFILE="latency" ;;
+        4) PROFILE="cpu-efficient" ;;
+        5) PROFILE="gaming" ;;
+        *) PROFILE="balanced" ;;
+    esac
+
+    # Obfuscation (Dagger default = enabled)
+    if [[ "$CMODE" == "1" ]]; then
+        OBFS_BOOL="true"; MIN_PAD=16; MAX_PAD=512; MIN_DELAY=5; MAX_DELAY=50; BURST_CHANCE=0.15
+    else
+        ask_obfs
+    fi
+
+    echo ""
+    echo -e "${CYAN}═══════════════════════════════════════${NC}"
+    echo -e "${CYAN}      CONNECTION PATHS                 ${NC}"
+    echo -e "${CYAN}═══════════════════════════════════════${NC}"
+    echo ""
+
+    # Transport selection (only httpmux implemented in RsTunnel right now)
+    echo "Select Transport Type:"
+    echo "  1) httpmux  - HTTP Mimicry"
+    read -r -p "Choice [1]: " TCH
+    TCH=${TCH:-1}
+    if [[ "$TCH" != "1" ]]; then
+        warn "Only httpmux is available in RsTunnel. Using httpmux."
+    fi
+
+    read -r -p "Server address with Tunnel Port (e.g., 1.2.3.4:2020): " ADDR
+    [[ -z "$ADDR" ]] && die "Server address required"
+    SIP="${ADDR%%:*}"
+    SPORT="${ADDR##*:}"
+
+    # Pool options
+    POOL_SIZE=2
+    AGGRESSIVE_POOL="false"
+    RETRY_INTERVAL=3
+    DIAL_TIMEOUT=10
+
+    if [[ "$CMODE" == "2" ]]; then
+        read -r -p "Connection pool size [2]: " POOL_SIZE
+        POOL_SIZE=${POOL_SIZE:-2}
+        read -r -p "Enable aggressive pool? [y/N]: " ap
+        if [[ "$ap" =~ ^[Yy] ]]; then AGGRESSIVE_POOL="true"; else AGGRESSIVE_POOL="false"; fi
+        read -r -p "Retry interval (seconds) [3]: " RETRY_INTERVAL
+        RETRY_INTERVAL=${RETRY_INTERVAL:-3}
+        read -r -p "Dial timeout (seconds) [10]: " DIAL_TIMEOUT
+        DIAL_TIMEOUT=${DIAL_TIMEOUT:-10}
+    else
+        # Automatic defaults similar to Dagger's wizard defaults
+        AGGRESSIVE_POOL="true"
+    fi
+
     ask_mimic
-    ask_obfs
-    
-    MAPPINGS_UDP_YAML=""
-    # Client usually doesn't need reverse listener setup via wizard in same way, 
-    # but structure supports it if needed. For now, basic config.
-    
+
+    read -r -p "Enable verbose logging? [y/N]: " v
+    if [[ "$v" =~ ^[Yy] ]]; then VERBOSE="true"; else VERBOSE="false"; fi
+
     write_client_config
     create_service "client"
     systemctl restart picotun-client || true
-    ok "Client configured and started."
-    echo ""
-    read -r -p "View live logs now? [y/N]: " yn
-    if [[ "$yn" =~ ^[Yy] ]]; then
-        show_logs "client"
-    fi
+    ok "Client installation complete!"
+    echo "Config: $CONFIG_DIR/client.yaml"
+    echo "View logs: journalctl -u picotun-client -f"
+    pause
 }
+
 
 manage_service() {
     while true; do
@@ -682,4 +816,5 @@ main_menu() {
 }
 
 check_root
+cd / || true
 main_menu

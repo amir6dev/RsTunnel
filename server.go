@@ -3,7 +3,6 @@ package httpmux
 import (
 	"bytes"
 	"io"
-	"net"
 	"net/http"
 	"sync"
 	"time"
