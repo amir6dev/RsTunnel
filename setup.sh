@@ -2,8 +2,7 @@
 set -euo pipefail
 
 # ============================================================================
-#  RsTunnel / PicoTun Manager (Dagger-Style, Extended Wizard)
-#  هدف: شبیه‌سازی تجربه نصب/کانفیگ DaggerConnect برای httpmux
+#  RsTunnel / PicoTun Manager (Fixed & Optimized)
 # ============================================================================
 
 # Colors
@@ -41,7 +40,7 @@ banner() {
     echo -e "${CYAN}"
     echo -e "${GREEN}*** RsTunnel / PicoTun  ***${NC}"
     echo -e "${BLUE}_____________________________${NC}"
-    echo -e "${PURPLE}  Dagger-Style Wizard (httpmux) ${NC}"
+    echo -e "${PURPLE}  Dagger-Style Wizard (Fixed)   ${NC}"
     echo -e "${BLUE}_____________________________${NC}"
     echo -e "${GREEN}*** Private Tunneling   ***${NC}"
     echo ""
@@ -105,7 +104,6 @@ update_core() {
     if [[ -f "${SCRIPT_DIR}/cmd/server/main.go" || -f "${SCRIPT_DIR}/cmd/client/main.go" ]]; then
         echo -e "${YELLOW}📁 Using local source (current directory) ...${NC}"
         mkdir -p "$BUILD_DIR"
-        # copy everything except common junk
         rsync -a --delete \
           --exclude ".git" --exclude "bin" --exclude "dist" --exclude "node_modules" \
           "${SCRIPT_DIR}/" "$BUILD_DIR/" >/dev/null 2>&1 || cp -a "${SCRIPT_DIR}/." "$BUILD_DIR/"
@@ -117,14 +115,12 @@ update_core() {
     cd "$BUILD_DIR"
     echo -e "${YELLOW}🔧 Fixing build environment (Iran Safe)...${NC}"
 
-    # اصلاح ساختار ماژول و ایمپورت‌ها برای رفع ارور بیلد
     rm -f go.mod go.sum
     go mod init github.com/amir6dev/rstunnel >/dev/null 2>&1 || true
 
     find . -name "*.go" -type f -exec sed -i 's|github.com/amir6dev/RsTunnel/PicoTun|github.com/amir6dev/rstunnel/PicoTun|g' {} +
     find . -name "*.go" -type f -exec sed -i 's|github.com/amir6dev/RsTunnel|github.com/amir6dev/rstunnel|g' {} +
 
-    # پین کردن نسخه کتابخانه‌ها (جلوگیری از ارور 403 گوگل)
     go get golang.org/x/net@v0.23.0 >/dev/null 2>&1
     go get github.com/refraction-networking/utls@v1.6.0 >/dev/null 2>&1
     go get github.com/xtaci/smux@v1.5.24 >/dev/null 2>&1
@@ -178,7 +174,7 @@ EOF
 }
 
 # ----------------------------------------------------------------------------
-#  Wizard Blocks (Dagger-like questions)
+#  Wizard Blocks
 # ----------------------------------------------------------------------------
 ask_session_timeout() {
     read -r -p "Session Timeout (seconds) [30]: " SESSION_TIMEOUT
@@ -215,10 +211,8 @@ ask_mimic() {
 
     read -r -p "Fake Path (for ServerURL) [/tunnel]: " FAKE_PATH
     FAKE_PATH=${FAKE_PATH:-/tunnel}
-    # NOTE: در کد فعلی endpoint سرور /tunnel است. اگر مسیر دیگری بدهید، فقط ServerURL کلاینت عوض می‌شود.
-    # برای جلوگیری از اشتباه، اگر چیزی غیر از /tunnel وارد شد هشدار می‌دهیم.
     if [[ "$FAKE_PATH" != "/tunnel" ]]; then
-        warn "در نسخه فعلی، مسیر سرور فقط /tunnel است. مسیر را به /tunnel برمی‌گردانیم."
+        warn "Path reset to /tunnel (hardcoded in this version)."
         FAKE_PATH="/tunnel"
     fi
 
@@ -229,33 +223,28 @@ ask_mimic() {
     if [[ "${SESSION_COOKIE}" =~ ^[Nn] ]]; then SESSION_COOKIE_BOOL="false"; else SESSION_COOKIE_BOOL="true"; fi
 
     CUSTOM_HEADERS_YAML=""
-echo ""
-echo -e "${YELLOW}Custom Headers (Optional)${NC}"
-echo -e "${YELLOW}Example: X-Forwarded-For: 1.2.3.4${NC}"
+    echo ""
+    echo -e "${YELLOW}Custom Headers (Optional)${NC}"
+    echo -e "${YELLOW}Example: X-Forwarded-For: 1.2.3.4${NC}"
+    while true; do
+        read -r -p "Add custom header? [y/N]: " yn
+        [[ ! "$yn" =~ ^[Yy] ]] && break
+        read -r -p "  Header (Key: Value): " hdr
+        hdr="$(echo "$hdr" | sed 's/^ *//;s/ *$//')"
+        if [[ -z "$hdr" || "$hdr" != *:* ]]; then
+            warn "Invalid header format. Skipping."
+            continue
+        fi
+        CUSTOM_HEADERS_YAML="${CUSTOM_HEADERS_YAML}    - "${hdr}"
+"
+        ok "Added header: $hdr"
+    done
 
-while true; do
-    read -r -p "Add custom header? [y/N]: " yn
-    [[ ! "$yn" =~ ^[Yy] ]] && break
-
-    read -r -p "  Header (Key: Value): " hdr
-    hdr="$(echo "$hdr" | sed 's/^ *//;s/ *$//')"
-
-    if [[ -z "$hdr" || "$hdr" != *:* ]]; then
-        warn "Invalid header format. Skipping."
-        continue
+    if [[ -z "$CUSTOM_HEADERS_YAML" ]]; then
+        CUSTOM_HEADERS_BLOCK="  custom_headers: []"
+    else
+        CUSTOM_HEADERS_BLOCK=$'  custom_headers:\n'"${CUSTOM_HEADERS_YAML%\n}"
     fi
-
-    # ✅ درست: هر هدر یک آیتم YAML با کوتیشن
-    CUSTOM_HEADERS_YAML+=$'    - "'"$hdr"$'"\n'
-    ok "Added header: $hdr"
-done
-
-if [[ -z "$CUSTOM_HEADERS_YAML" ]]; then
-    CUSTOM_HEADERS_BLOCK="  custom_headers: []"
-else
-    CUSTOM_HEADERS_BLOCK=$'  custom_headers:\n'"${CUSTOM_HEADERS_YAML}"
-fi
-
 }
 
 ask_obfs() {
@@ -282,26 +271,13 @@ ask_obfs() {
     MIN_DELAY=${MIN_DELAY:-0}
     read -r -p "Max Delay (ms) [0]: " MAX_DELAY
     MAX_DELAY=${MAX_DELAY:-0}
-
-    for v in MIN_PAD MAX_PAD MIN_DELAY MAX_DELAY; do
-        if ! [[ "${!v}" =~ ^[0-9]+$ ]]; then
-            warn "Invalid ${v}, using default."
-        fi
-    done
 }
 
-# Port Mapping parser like DaggerConnect (TCP only; UDP not implemented in current core)
 build_port_mappings_tcp() {
     echo ""
     echo -e "${CYAN}═══════════════════════════════════════${NC}"
     echo -e "${CYAN}      PORT MAPPINGS (Reverse TCP)      ${NC}"
     echo -e "${CYAN}═══════════════════════════════════════${NC}"
-    echo ""
-    echo -e "${YELLOW}Help:${NC}"
-    echo "  ${GREEN}Single Port${NC}:        8008                 → Bind=8008, Target=8008"
-    echo "  ${GREEN}Range${NC}:             1000/1010            → 1000→1000 ... 1010→1010"
-    echo "  ${GREEN}Custom Mapping${NC}:    5000=8008            → 5000→8008"
-    echo "  ${GREEN}Range Mapping${NC}:     1000/1010=2000/2010  → 1000→2000 ... 1010→2010"
     echo ""
 
     read -r -p "Bind IP [0.0.0.0]: " BIND_IP
@@ -314,110 +290,34 @@ build_port_mappings_tcp() {
 
     while true; do
         echo ""
-        echo -e "${YELLOW}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
-        echo -e "${YELLOW}  Mapping #$((COUNT+1))${NC}"
-        echo -e "${YELLOW}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
-
-        read -r -p "Enter port(s) (or empty to finish): " PORT_INPUT
+        read -r -p "Enter port(s) (e.g. 8080 or 1000/2000) (Empty to finish): " PORT_INPUT
         PORT_INPUT="$(echo "${PORT_INPUT:-}" | tr -d ' ')"
         [[ -z "$PORT_INPUT" ]] && break
 
-        # 1) Range Mapping: a/b=c/d
-        if [[ "$PORT_INPUT" =~ ^([0-9]+)/([0-9]+)=([0-9]+)/([0-9]+)$ ]]; then
-            BIND_START="${BASH_REMATCH[1]}"; BIND_END="${BASH_REMATCH[2]}"
-            TARGET_START="${BASH_REMATCH[3]}"; TARGET_END="${BASH_REMATCH[4]}"
-            BIND_RANGE=$((BIND_END - BIND_START + 1))
-            TARGET_RANGE=$((TARGET_END - TARGET_START + 1))
-            if [[ "$BIND_RANGE" -ne "$TARGET_RANGE" ]]; then
-                warn "Range size mismatch!"
-                continue
-            fi
-            if [[ "$BIND_START" -lt 1 || "$BIND_END" -gt 65535 || "$TARGET_START" -lt 1 || "$TARGET_END" -gt 65535 ]]; then
-                warn "Invalid port range (1-65535)"
-                continue
-            fi
-            for ((i=0; i<BIND_RANGE; i++)); do
-                BP=$((BIND_START + i))
-                TP=$((TARGET_START + i))
-                MAPPINGS_TCP_YAML+=$'    - "'"${BIND_IP}:${BP}->${TARGET_IP}:${TP}"$'"
-'
-                COUNT=$((COUNT + 1))
-            done
-            ok "Added ${BIND_RANGE} mappings: ${BIND_START}→${TARGET_START} ... ${BIND_END}→${TARGET_END}"
-            continue
-        fi
-
-        # 2) Range: a/b (Bind=Target)
         if [[ "$PORT_INPUT" =~ ^([0-9]+)/([0-9]+)$ ]]; then
             START_PORT="${BASH_REMATCH[1]}"; END_PORT="${BASH_REMATCH[2]}"
-            if [[ "$START_PORT" -gt "$END_PORT" ]]; then
-                warn "Start port cannot be greater than end port."
-                continue
-            fi
-            if [[ "$START_PORT" -lt 1 || "$END_PORT" -gt 65535 ]]; then
-                warn "Invalid port range (1-65535)"
-                continue
-            fi
             for ((p=START_PORT; p<=END_PORT; p++)); do
-                MAPPINGS_TCP_YAML+=$'    - "'"${BIND_IP}:${p}->${TARGET_IP}:${p}"$'"
-'
+                MAPPINGS_TCP_YAML+=$'    - "'"${BIND_IP}:${p}->${TARGET_IP}:${p}"$'"\n'
                 COUNT=$((COUNT + 1))
             done
-            ok "Added $((END_PORT-START_PORT+1)) mappings (Bind=Target)"
-            continue
-        fi
-
-        # 3) Custom Mapping: a=b
-        if [[ "$PORT_INPUT" =~ ^([0-9]+)=([0-9]+)$ ]]; then
-            BP="${BASH_REMATCH[1]}"; TP="${BASH_REMATCH[2]}"
-            if [[ "$BP" -lt 1 || "$BP" -gt 65535 || "$TP" -lt 1 || "$TP" -gt 65535 ]]; then
-                warn "Invalid ports (1-65535)"
-                continue
-            fi
-            MAPPINGS_TCP_YAML+=$'    - "'"${BIND_IP}:${BP}->${TARGET_IP}:${TP}"$'"
-'
+            ok "Added range ${START_PORT}-${END_PORT}"
+        elif [[ "$PORT_INPUT" =~ ^([0-9]+)$ ]]; then
+            BP="${BASH_REMATCH[1]}"
+            MAPPINGS_TCP_YAML+=$'    - "'"${BIND_IP}:${BP}->${TARGET_IP}:${BP}"$'"\n'
             COUNT=$((COUNT + 1))
-            ok "Added mapping: ${BP}→${TP}"
-            continue
+            ok "Added port ${BP}"
+        else
+            warn "Invalid format. Use single port (80) or range (80/90)."
         fi
-
-        # 4) Single Port: a (Bind=Target)
-        if [[ "$PORT_INPUT" =~ ^([0-9]+)$ ]]; then
-            BP="${BASH_REMATCH[1]}"; TP="${BASH_REMATCH[1]}"
-            if [[ "$BP" -lt 1 || "$BP" -gt 65535 ]]; then
-                warn "Invalid port (1-65535)"
-                continue
-            fi
-            MAPPINGS_TCP_YAML+=$'    - "'"${BIND_IP}:${BP}->${TARGET_IP}:${TP}"$'"
-'
-            COUNT=$((COUNT + 1))
-            ok "Added mapping: ${BP}→${TP}"
-            continue
-        fi
-
-        warn "Invalid format. Try again."
     done
-
-    if [[ -z "$MAPPINGS_TCP_YAML" ]]; then
-        warn "No TCP mappings added. (Reverse TCP listeners will not start)"
-    else
-        ok "Total TCP mappings: $COUNT"
-    fi
+    ok "Total TCP mappings: $COUNT"
 }
 
-
-# Port Mapping parser like DaggerConnect (UDP)
 build_port_mappings_udp() {
     echo ""
     echo -e "${CYAN}═══════════════════════════════════════${NC}"
     echo -e "${CYAN}      PORT MAPPINGS (Reverse UDP)      ${NC}"
     echo -e "${CYAN}═══════════════════════════════════════${NC}"
-    echo ""
-    echo -e "${YELLOW}Help:${NC}"
-    echo "  ${GREEN}Single Port${NC}:        8008                 → Bind=8008, Target=8008"
-    echo "  ${GREEN}Range${NC}:             1000/1010            → 1000→1000 ... 1010→1010"
-    echo "  ${GREEN}Custom Mapping${NC}:    5000=8008            → 5000→8008"
-    echo "  ${GREEN}Range Mapping${NC}:     1000/1010=2000/2010  → 1000→2000 ... 1010→2010"
     echo ""
 
     read -r -p "Bind IP [0.0.0.0]: " BIND_IP_UDP
@@ -430,98 +330,41 @@ build_port_mappings_udp() {
 
     while true; do
         echo ""
-        echo -e "${YELLOW}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
-        echo -e "${YELLOW}  UDP Mapping #$((COUNT_UDP+1))${NC}"
-        echo -e "${YELLOW}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
-
-        read -r -p "Enter port(s) (or empty to finish): " PORT_INPUT
+        read -r -p "Enter UDP port(s) (Empty to finish): " PORT_INPUT
         PORT_INPUT="$(echo "${PORT_INPUT:-}" | tr -d ' ')"
         [[ -z "$PORT_INPUT" ]] && break
 
-        # 1) Range Mapping: a/b=c/d
-        if [[ "$PORT_INPUT" =~ ^([0-9]+)/([0-9]+)=([0-9]+)/([0-9]+)$ ]]; then
-            BIND_START="${BASH_REMATCH[1]}"; BIND_END="${BASH_REMATCH[2]}"
-            TARGET_START="${BASH_REMATCH[3]}"; TARGET_END="${BASH_REMATCH[4]}"
-            BIND_RANGE=$((BIND_END - BIND_START + 1))
-            TARGET_RANGE=$((TARGET_END - TARGET_START + 1))
-            if [[ "$BIND_RANGE" -ne "$TARGET_RANGE" ]]; then
-                warn "Range size mismatch!"
-                continue
-            fi
-            if [[ "$BIND_START" -lt 1 || "$BIND_END" -gt 65535 || "$TARGET_START" -lt 1 || "$TARGET_END" -gt 65535 ]]; then
-                warn "Invalid port range (1-65535)"
-                continue
-            fi
-            for ((i=0; i<BIND_RANGE; i++)); do
-                BP=$((BIND_START + i))
-                TP=$((TARGET_START + i))
-                MAPPINGS_UDP_YAML+=$'    - "'"${BIND_IP_UDP}:${BP}->${TARGET_IP_UDP}:${TP}"$'"\n"
-                COUNT_UDP=$((COUNT_UDP + 1))
-            done
-            ok "Added ${BIND_RANGE} UDP mappings: ${BIND_START}→${TARGET_START} ... ${BIND_END}→${TARGET_END}"
-            continue
-        fi
-
-        # 2) Range: a/b (Bind=Target)
-        if [[ "$PORT_INPUT" =~ ^([0-9]+)/([0-9]+)$ ]]; then
-            START_PORT="${BASH_REMATCH[1]}"; END_PORT="${BASH_REMATCH[2]}"
-            if [[ "$START_PORT" -gt "$END_PORT" ]]; then
-                warn "Start port cannot be greater than end port."
-                continue
-            fi
-            if [[ "$START_PORT" -lt 1 || "$END_PORT" -gt 65535 ]]; then
-                warn "Invalid port range (1-65535)"
-                continue
-            fi
-            for ((p=START_PORT; p<=END_PORT; p++)); do
-                MAPPINGS_UDP_YAML+=$'    - "'"${BIND_IP_UDP}:${p}->${TARGET_IP_UDP}:${p}"$'"\n"
-                COUNT_UDP=$((COUNT_UDP + 1))
-            done
-            ok "Added $((END_PORT-START_PORT+1)) UDP mappings (Bind=Target)"
-            continue
-        fi
-
-        # 3) Custom Mapping: a=b
-        if [[ "$PORT_INPUT" =~ ^([0-9]+)=([0-9]+)$ ]]; then
-            BP="${BASH_REMATCH[1]}"; TP="${BASH_REMATCH[2]}"
-            if [[ "$BP" -lt 1 || "$BP" -gt 65535 || "$TP" -lt 1 || "$TP" -gt 65535 ]]; then
-                warn "Invalid ports (1-65535)"
-                continue
-            fi
-            MAPPINGS_UDP_YAML+=$'    - "'"${BIND_IP_UDP}:${BP}->${TARGET_IP_UDP}:${TP}"$'"\n"
-            COUNT_UDP=$((COUNT_UDP + 1))
-            ok "Added UDP mapping: ${BP}→${TP}"
-            continue
-        fi
-
-        # 4) Single Port: a (Bind=Target)
         if [[ "$PORT_INPUT" =~ ^([0-9]+)$ ]]; then
-            BP="${BASH_REMATCH[1]}"; TP="${BASH_REMATCH[1]}"
-            if [[ "$BP" -lt 1 || "$BP" -gt 65535 ]]; then
-                warn "Invalid port (1-65535)"
-                continue
-            fi
-            MAPPINGS_UDP_YAML+=$'    - "'"${BIND_IP_UDP}:${BP}->${TARGET_IP_UDP}:${TP}"$'"\n"
+            BP="${BASH_REMATCH[1]}"
+            MAPPINGS_UDP_YAML+=$'    - "'"${BIND_IP_UDP}:${BP}->${TARGET_IP_UDP}:${BP}"$'"\n'
             COUNT_UDP=$((COUNT_UDP + 1))
-            ok "Added UDP mapping: ${BP}→${TP}"
-            continue
+            ok "Added UDP port ${BP}"
+        else
+            warn "Invalid format. Use single port."
         fi
-
-        warn "Invalid format. Try again."
     done
-
-    if [[ -z "$MAPPINGS_UDP_YAML" ]]; then
-        warn "No UDP mappings added. (Reverse UDP listeners will not start)"
-    else
-        ok "Total UDP mappings: $COUNT_UDP"
-    fi
+    ok "Total UDP mappings: $COUNT_UDP"
 }
 
 # ----------------------------------------------------------------------------
-#  Config Writers
+#  Config Writers (FIXED: No syntax error here)
 # ----------------------------------------------------------------------------
 write_server_config() {
     mkdir -p "$CONFIG_DIR"
+    
+    # Prepare variables OUTSIDE the heredoc to avoid $() syntax errors
+    local TCP_VAL=" []"
+    if [[ -n "${MAPPINGS_TCP_YAML:-}" ]]; then
+        TCP_VAL="
+${MAPPINGS_TCP_YAML}"
+    fi
+
+    local UDP_VAL=" []"
+    if [[ -n "${MAPPINGS_UDP_YAML:-}" ]]; then
+        UDP_VAL="
+${MAPPINGS_UDP_YAML}"
+    fi
+
     cat > "$CONFIG_DIR/server.yaml" <<EOF
 mode: "server"
 listen: "${LISTEN_ADDR}"
@@ -543,15 +386,20 @@ obfs:
   max_delay: ${MAX_DELAY}
 
 forward:
-  tcp:
-$(printf "%s" "${MAPPINGS_TCP_YAML:-}")
-  udp:
-$(printf "%s" "${MAPPINGS_UDP_YAML:-}")
+  tcp:${TCP_VAL}
+  udp:${UDP_VAL}
 EOF
 }
 
 write_client_config() {
     mkdir -p "$CONFIG_DIR"
+    
+    local UDP_VAL=" []"
+    if [[ -n "${MAPPINGS_UDP_YAML:-}" ]]; then
+        UDP_VAL="
+${MAPPINGS_UDP_YAML}"
+    fi
+
     cat > "$CONFIG_DIR/client.yaml" <<EOF
 mode: "client"
 server_url: "http://${SIP}:${SPORT}${FAKE_PATH}"
@@ -574,8 +422,7 @@ obfs:
 
 forward:
   tcp: []
-  udp:
-$(printf "%s" "${MAPPINGS_UDP_YAML:-}")
+  udp:${UDP_VAL}
 EOF
 }
 
@@ -620,7 +467,7 @@ show_logs() {
 }
 
 # ----------------------------------------------------------------------------
-#  Wizards
+#  Main Logic
 # ----------------------------------------------------------------------------
 configure_server() {
     banner
@@ -639,17 +486,18 @@ configure_server() {
     ask_psk
     ask_mimic
     ask_obfs
-    echo ""
-    echo -e "${CYAN}═══════════════════════════════════════${NC}"
-    echo -e "${CYAN}      REVERSE MODE (TCP/UDP)           ${NC}"
-    echo -e "${CYAN}═══════════════════════════════════════${NC}"
+    
     echo ""
     echo "1) TCP only (recommended)"
     echo "2) UDP only"
     echo "3) TCP + UDP"
     echo "4) None"
-    read -r -p "Select [1]: " REV_MODE
+    read -r -p "Select Reverse Mode [1]: " REV_MODE
     REV_MODE=${REV_MODE:-1}
+
+    # Clear previous vars
+    MAPPINGS_TCP_YAML=""
+    MAPPINGS_UDP_YAML=""
 
     case "$REV_MODE" in
         1) build_port_mappings_tcp ;;
@@ -659,15 +507,12 @@ configure_server() {
         *) warn "Invalid choice, defaulting to TCP only."; build_port_mappings_tcp ;;
     esac
 
-
     write_server_config
     create_service "server"
 
     echo ""
     echo -e "${GREEN}Configuration Complete!${NC}"
-    echo -e "Listen: ${YELLOW}${LISTEN_ADDR}${NC}"
-    echo -e "Endpoint: ${YELLOW}${FAKE_PATH}${NC}"
-    echo -e "PSK: ${YELLOW}${PSK}${NC} (Copy this for client)"
+    echo -e "PSK: ${YELLOW}${PSK}${NC}"
     echo ""
     pause
 
@@ -696,10 +541,11 @@ configure_client() {
     read -r -p "Enter PSK (From Server): " PSK
     [[ -z "${PSK}" ]] && die "PSK is required"
 
-    # Mimic/Obfs should match server
     ask_mimic
     ask_obfs
-
+    
+    # Init vars
+    MAPPINGS_UDP_YAML=""
     write_client_config
     create_service "client"
     systemctl restart picotun-client || true
