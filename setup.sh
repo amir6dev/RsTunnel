@@ -1,31 +1,43 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# RsTunnel installer (Dagger-like UX) - httpmux focused
+# ============================================================
+# RsTunnel (picotun) Installer - Dagger-like UX (Iran-safe)
+# - NO GitHub API
+# - NO Python JSON parsing
+# - Installs Release binary (no Go required)
+# - Idempotent deps install (skip if installed)
+# - Updates core if newer tag is available
+# - Creates systemd services for server/client
+# ============================================================
 
 APP_NAME="RsTunnel"
 BIN_NAME="picotun"
-INSTALL_DIR="/etc/${BIN_NAME}"
-BIN_PATH="/usr/local/bin/${BIN_NAME}"
-VERSION_FILE="${INSTALL_DIR}/.installed_tag"
-SERVICE_SERVER="${BIN_NAME}-server"
-SERVICE_CLIENT="${BIN_NAME}-client"
 
 REPO_OWNER="amir6dev"
 REPO_NAME="RsTunnel"
 
-# Prefer release assets (so we DON'T need Go on Iranian servers)
-# Expected asset name pattern (must exist in GitHub Releases):
+INSTALL_DIR="/etc/${BIN_NAME}"
+BIN_PATH="/usr/local/bin/${BIN_NAME}"
+VERSION_FILE="${INSTALL_DIR}/.installed_tag"
+
+SERVICE_SERVER="${BIN_NAME}-server"
+SERVICE_CLIENT="${BIN_NAME}-client"
+
+# Expected release assets:
 #   picotun_linux_amd64.tar.gz
 #   picotun_linux_arm64.tar.gz
 #
 # Each tar.gz should contain a single executable named "picotun".
+
 DL_PREFIXES=(
-  ""  # direct
+  ""
   "https://ghproxy.com/"
   "https://mirror.ghproxy.com/"
+  "https://gh-proxy.com/"
 )
 
+# --------- Colors / UI ----------
 COLOR_RESET="\033[0m"
 COLOR_GREEN="\033[0;32m"
 COLOR_RED="\033[0;31m"
@@ -36,10 +48,40 @@ log()  { echo -e "${COLOR_CYAN}$*${COLOR_RESET}"; }
 ok()   { echo -e "${COLOR_GREEN}✓${COLOR_RESET} $*"; }
 warn() { echo -e "${COLOR_YELLOW}!${COLOR_RESET} $*"; }
 err()  { echo -e "${COLOR_RED}✖${COLOR_RESET} $*"; }
+
 pause() { read -r -p "Press Enter to return..." _; }
 
-need_root() { [[ "${EUID:-$(id -u)}" -eq 0 ]] || { err "Run as root."; exit 1; }; }
+need_root() {
+  if [[ "${EUID:-$(id -u)}" -ne 0 ]]; then
+    err "Run as root."
+    exit 1
+  fi
+}
+
 have_cmd() { command -v "$1" >/dev/null 2>&1; }
+
+ask() {
+  local prompt="$1" def="${2:-}"
+  local ans
+  if [[ -n "$def" ]]; then
+    read -r -p "${prompt} [${def}]: " ans
+    echo "${ans:-$def}"
+  else
+    read -r -p "${prompt}: " ans
+    echo "$ans"
+  fi
+}
+
+ask_yn() {
+  local prompt="$1" def="${2:-Y}"
+  local ans
+  read -r -p "${prompt} [${def}]: " ans
+  ans="${ans:-$def}"
+  case "$ans" in
+    y|Y|yes|YES) return 0 ;;
+    *) return 1 ;;
+  esac
+}
 
 detect_arch() {
   case "$(uname -m || true)" in
@@ -49,6 +91,7 @@ detect_arch() {
   esac
 }
 
+# --------- Package install ----------
 pkg_install() {
   local pkgs=("$@")
   if have_cmd apt-get; then
@@ -61,7 +104,7 @@ pkg_install() {
   elif have_cmd apk; then
     apk add --no-cache "${pkgs[@]}"
   else
-    err "No supported package manager found."
+    err "No supported package manager found (apt/yum/dnf/apk)."
     exit 1
   fi
 }
@@ -74,6 +117,7 @@ ensure_deps() {
     have_cmd "$c" || missing+=("$c")
   done
   have_cmd git || missing+=("git")
+  have_cmd systemctl || missing+=("systemd") # soft check
 
   if ((${#missing[@]}==0)); then
     ok "Dependencies already installed"
@@ -81,22 +125,30 @@ ensure_deps() {
   fi
 
   warn "Installing missing: ${missing[*]}"
-  pkg_install "${missing[@]}"
-  ok "Dependencies installed"
+  # Note: "systemd" package name differs; we won't try install it automatically.
+  # We'll only install standard tools; systemd is assumed on most servers.
+  local installable=()
+  for p in "${missing[@]}"; do
+    [[ "$p" == "systemd" ]] || installable+=("$p")
+  done
+
+  if ((${#installable[@]} > 0)); then
+    pkg_install "${installable[@]}"
+  fi
+  ok "Dependencies installed/ready"
 }
 
-curl_try() {
-  local url="$1" out="$2"
-  curl -fL --retry 3 --retry-delay 1 --connect-timeout 10 --max-time 240 "$url" -o "$out"
-}
-
+# --------- Download helpers ----------
 download_with_prefixes() {
   local url="$1" out="$2"
   local p full
+
   rm -f "$out" >/dev/null 2>&1 || true
   for p in "${DL_PREFIXES[@]}"; do
     full="${p}${url}"
-    if curl_try "$full" "$out" >/dev/null 2>&1; then
+    if curl -fL --retry 3 --retry-delay 1 --connect-timeout 10 --max-time 240 \
+      -H "Accept: application/octet-stream" \
+      "$full" -o "$out" >/dev/null 2>&1; then
       if [[ -s "$out" ]]; then
         return 0
       fi
@@ -106,77 +158,21 @@ download_with_prefixes() {
   return 1
 }
 
-is_json_file() {
-  local f="$1"
-  [[ -s "$f" ]] || return 1
-  local first
-  first="$(tr -d '\n\r\t ' <"$f" | head -c 1 || true)"
-  [[ "$first" == "{" || "$first" == "[" ]]
-}
-
-verify_elf_arch() {
-  local bin="$1" arch="$2"
-  local info
-  info="$(file "$bin" || true)"
-  echo "$info" | grep -q "ELF" || { err "Not an ELF binary: $info"; return 1; }
-  if [[ "$arch" == "amd64" ]]; then
-    echo "$info" | grep -qiE "x86-64|x86_64" || { err "Wrong arch (expected amd64): $info"; return 1; }
-  else
-    echo "$info" | grep -qiE "aarch64|ARM aarch64" || { err "Wrong arch (expected arm64): $info"; return 1; }
-  fi
-}
-
-ask() {
-  local prompt="$1" def="${2:-}"
-  if [[ -n "$def" ]]; then
-    read -r -p "${prompt} [${def}]: " ans
-    echo "${ans:-$def}"
-  else
-    read -r -p "${prompt}: " ans
-    echo "$ans"
-  fi
-}
-
-ask_yn() {
-  local prompt="$1" def="${2:-Y}"
-  local d="$def"
-  local ans
-  read -r -p "${prompt} [${d}]: " ans
-  ans="${ans:-$d}"
-  case "$ans" in
-    y|Y|yes|YES) return 0 ;;
-    *) return 1 ;;
-  esac
-}
-
-systemd_reload() { systemctl daemon-reload >/dev/null 2>&1 || true; }
-enable_start() {
-  local svc="$1"
-  systemctl enable --now "${svc}.service" >/dev/null 2>&1 || true
-}
-
-stop_disable() {
-  local svc="$1"
-  systemctl disable --now "${svc}.service" >/dev/null 2>&1 || true
-}
-
 get_latest_tag_via_redirect() {
+  # Iran-safe: no GitHub API; only releases/latest redirect
   local url="https://github.com/${REPO_OWNER}/${REPO_NAME}/releases/latest"
-  local loc p u
+  local p u loc
+
   for p in "${DL_PREFIXES[@]}"; do
     u="${p}${url}"
-    loc="$(curl -fsSLI "$u" 2>/dev/null | awk -F': ' 'tolower($1)=="location"{print $2}' | tail -n 1 | tr -d '\r')"
+    loc="$(curl -fsSLI --connect-timeout 10 --max-time 30 "$u" 2>/dev/null \
+      | awk -F': ' 'tolower($1)=="location"{print $2}' | tail -n 1 | tr -d '\r')"
     if [[ -n "$loc" ]]; then
       echo "$loc" | awk -F'/tag/' '{print $2}' | tr -d '\r'
       return 0
     fi
   done
   return 1
-}
-
-pick_asset_url_no_api() {
-  local arch="$1" tag="$2"
-  echo "https://github.com/${REPO_OWNER}/${REPO_NAME}/releases/download/${tag}/picotun_linux_${arch}.tar.gz"
 }
 
 read_installed_tag() {
@@ -189,82 +185,62 @@ write_installed_tag() {
   echo -n "$tag" > "$VERSION_FILE"
 }
 
+verify_elf_arch() {
+  local bin="$1" arch="$2"
+  local info
+  info="$(file "$bin" || true)"
+
+  echo "$info" | grep -q "ELF" || { err "Not an ELF binary: $info"; return 1; }
+
+  if [[ "$arch" == "amd64" ]]; then
+    echo "$info" | grep -qiE "x86-64|x86_64" || { err "Wrong arch (expected amd64): $info"; return 1; }
+  else
+    echo "$info" | grep -qiE "aarch64|ARM aarch64" || { err "Wrong arch (expected arm64): $info"; return 1; }
+  fi
+}
+
 install_core_from_release() {
   ensure_deps
 
-  local arch tag url
+  local arch tag url installed tmpd tgz
   arch="$(detect_arch)"
   log "⬇️  Installing core for arch: ${arch}"
 
-  tag=""
-  url=""
-
-  local api="https://api.github.com/repos/${REPO_OWNER}/${REPO_NAME}/releases/latest"
-  local jsonf
-  jsonf="$(mktemp /tmp/picotun.release.XXXXXX.json)"
-
-  local have_api=0
-  if download_with_prefixes "$api" "$jsonf" && is_json_file "$jsonf" && have_cmd python3; then
-    have_api=1
-  fi
-
-  if [[ "$have_api" -eq 1 ]]; then
-    tag="$(python3 - <<'PY' <"$jsonf" 2>/dev/null || true
-import json,sys
-try:
-    data=json.load(sys.stdin)
-    print(data.get("tag_name",""))
-except Exception:
-    pass
-PY
-)"
-    url="$(python3 - "$arch" <<'PY' <"$jsonf" 2>/dev/null || true
-import json,sys
-arch=sys.argv[1]
-want=f"picotun_linux_{arch}.tar.gz"
-try:
-    data=json.load(sys.stdin)
-    for a in data.get("assets",[]):
-        if a.get("name","")==want:
-            print(a.get("browser_download_url",""))
-            raise SystemExit(0)
-except Exception:
-    pass
-raise SystemExit(1)
-PY
-)" || true
-  fi
-
-  rm -f "$jsonf" >/dev/null 2>&1 || true
-
+  tag="$(get_latest_tag_via_redirect || true)"
   if [[ -z "$tag" ]]; then
-    tag="$(get_latest_tag_via_redirect || true)"
+    err "Could not detect latest release tag (redirect blocked)."
+    err "Try changing mirrors, or use a proxy/VPN."
+    return 1
   fi
 
-  if [[ -z "$url" ]]; then
-    [[ -n "$tag" ]] || { err "Could not detect latest release tag."; return 1; }
-    url="$(pick_asset_url_no_api "$arch" "$tag")"
-  fi
+  url="https://github.com/${REPO_OWNER}/${REPO_NAME}/releases/download/${tag}/${BIN_NAME}_linux_${arch}.tar.gz"
 
-  local installed
   installed="$(read_installed_tag)"
   if [[ -n "$installed" && "$installed" == "$tag" && -x "$BIN_PATH" ]]; then
     ok "Core already up-to-date (${tag})"
     return 0
   fi
 
-  local tmpd tgz
-  tmpd="$(mktemp -d /tmp/picotun-dl.XXXXXX)"
-  tgz="${tmpd}/picotun.tgz"
+  tmpd="$(mktemp -d /tmp/${BIN_NAME}-dl.XXXXXX)"
+  tgz="${tmpd}/${BIN_NAME}.tgz"
 
   if ! download_with_prefixes "$url" "$tgz"; then
     rm -rf "$tmpd" || true
-    err "Download failed. URL: $url"
+    err "Download failed (blocked or mirror issue)."
+    err "URL: $url"
+    return 1
+  fi
+
+  # Detect HTML/text (blocked/proxy page)
+  if file "$tgz" | grep -qiE "HTML|text"; then
+    warn "Downloaded content looks like HTML/text (blocked/proxy page)."
+    rm -rf "$tmpd" || true
+    err "Core update failed. Try changing mirror prefixes or use a proxy."
     return 1
   fi
 
   if ! file "$tgz" | grep -qiE "gzip compressed data"; then
-    warn "Downloaded file is not a gzip archive. (Maybe blocked/proxy HTML?)"
+    warn "Downloaded file is not a gzip archive."
     rm -rf "$tmpd" || true
     err "Core update failed."
     return 1
@@ -274,6 +250,7 @@ PY
   if [[ ! -f "${tmpd}/${BIN_NAME}" ]]; then
     rm -rf "$tmpd" || true
     err "Archive doesn't contain ${BIN_NAME}"
+    err "Make sure release asset contains a file named '${BIN_NAME}'"
     return 1
   fi
 
@@ -288,6 +265,7 @@ PY
   return 0
 }
 
+# --------- User-Agent helper ----------
 ua_by_choice() {
   case "$1" in
     2) echo "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:122.0) Gecko/20100101 Firefox/122.0" ;;
@@ -296,6 +274,19 @@ ua_by_choice() {
     5) echo "Mozilla/5.0 (Linux; Android 13; Pixel 7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36" ;;
     *) echo "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36" ;;
   esac
+}
+
+# --------- systemd helpers ----------
+systemd_reload() { systemctl daemon-reload >/dev/null 2>&1 || true; }
+
+enable_start() {
+  local svc="$1"
+  systemctl enable --now "${svc}.service" >/dev/null 2>&1 || true
+}
+
+stop_disable() {
+  local svc="$1"
+  systemctl disable --now "${svc}.service" >/dev/null 2>&1 || true
 }
 
 write_server_service() {
@@ -344,16 +335,23 @@ WantedBy=multi-user.target
 EOF
 }
 
+# --------- health checks ----------
 health_check_server() {
   local port="$1"
   echo
   log "🔎 Checking server service & tunnel port..."
-  systemctl is-active --quiet "${SERVICE_SERVER}.service" && ok "Service is active" || warn "Service not active"
+  if systemctl is-active --quiet "${SERVICE_SERVER}.service"; then
+    ok "Service is active"
+  else
+    warn "Service not active"
+  fi
+
   if have_cmd ss; then
     ss -lntp | grep -E "[: ]${port}\b" >/dev/null 2>&1 && ok "Listening on port ${port}" || warn "Not listening on port ${port}"
   elif have_cmd netstat; then
     netstat -lntp 2>/dev/null | grep -E "[:.]${port}\b" >/dev/null 2>&1 && ok "Listening on port ${port}" || warn "Not listening on port ${port}"
   fi
+
   curl -fsS "http://127.0.0.1:${port}/tunnel" >/dev/null 2>&1 && ok "HTTP endpoint responds" || warn "HTTP endpoint probe failed (may still be OK if it expects framed traffic)"
 }
 
@@ -363,6 +361,7 @@ health_check_client() {
   systemctl is-active --quiet "${SERVICE_CLIENT}.service" && ok "Service is active" || warn "Service not active"
 }
 
+# --------- flows ----------
 install_server_flow() {
   clear
   echo "═══════════════════════════════════════"
@@ -397,6 +396,7 @@ install_server_flow() {
   echo
   echo "PORT MAPPINGS"
   echo
+
   local maps=()
   local idx=1
   while true; do
@@ -406,8 +406,10 @@ install_server_flow() {
     bind_port="$(ask "Bind Port (port on this server, e.g., 2222)" "")"
     target_port="$(ask "Target Port (destination port, e.g., 22)" "")"
     proto="$(ask "Protocol (tcp/udp/both)" "tcp")"
-    maps+=("$proto|0.0.0.0:${bind_port}|127.0.0.1:${target_port}")
+
+    maps+=("${proto}|0.0.0.0:${bind_port}|127.0.0.1:${target_port}")
     ok "Mapping added: 0.0.0.0:${bind_port} → 127.0.0.1:${target_port} (${proto})"
+
     if ! ask_yn "Add another mapping?" "N"; then break; fi
     idx=$((idx+1))
   done
@@ -653,9 +655,14 @@ install_client_flow() {
   systemd_reload
   enable_start "$SERVICE_CLIENT"
 
-  ok "Client configured"
+  ok "✓ Client installation complete!"
+  echo
+  echo "Important Info:"
+  echo "  Profile: ${profile}"
+  echo "  Obfuscation: ${obfs_enabled}"
+  echo
   echo "  Config: ${cfg}"
-  echo "  Logs: journalctl -u ${SERVICE_CLIENT} -f"
+  echo "  View logs: journalctl -u ${SERVICE_CLIENT} -f"
 
   if ask_yn "Check service now?" "Y"; then
     health_check_client
@@ -707,6 +714,20 @@ settings_menu() {
   done
 }
 
+update_core_flow() {
+  clear
+  echo "═══════════════════════════════════════"
+  echo "           UPDATE CORE"
+  echo "═══════════════════════════════════════"
+  echo
+  if install_core_from_release; then
+    ok "Core updated."
+  else
+    err "Core update failed."
+  fi
+  pause
+}
+
 uninstall_all() {
   clear
   echo "═══════════════════════════════════════"
@@ -749,10 +770,7 @@ main_menu() {
       1) install_server_flow ;;
       2) install_client_flow ;;
       3) settings_menu ;;
-      4)
-        if install_core_from_release; then ok "Core updated"; else err "Core update failed"; fi
-        pause
-        ;;
+      4) update_core_flow ;;
       5) uninstall_all ;;
       0) exit 0 ;;
       *) ;;
