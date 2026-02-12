@@ -300,7 +300,7 @@ After=network.target
 Type=simple
 User=root
 WorkingDirectory=${INSTALL_DIR}
-ExecStart=${BIN_PATH} -c ${cfg}
+ExecStart=${BIN_PATH} -config ${cfg}
 Restart=always
 RestartSec=3
 StandardOutput=journal
@@ -323,7 +323,7 @@ After=network.target
 Type=simple
 User=root
 WorkingDirectory=${INSTALL_DIR}
-ExecStart=${BIN_PATH} -c ${cfg}
+ExecStart=${BIN_PATH} -config ${cfg}
 Restart=always
 RestartSec=3
 StandardOutput=journal
@@ -338,21 +338,43 @@ EOF
 # --------- health checks ----------
 health_check_server() {
   local port="$1"
+  local cfg="${INSTALL_DIR}/server.yaml"
+
   echo
   log "🔎 Checking server service & tunnel port..."
   if systemctl is-active --quiet "${SERVICE_SERVER}.service"; then
     ok "Service is active"
   else
-    warn "Service not active"
+    warn "Service not active (check: journalctl -u ${SERVICE_SERVER} -f)"
   fi
 
   if have_cmd ss; then
-    ss -lntp | grep -E "[: ]${port}\b" >/dev/null 2>&1 && ok "Listening on port ${port}" || warn "Not listening on port ${port}"
+    ss -lntp | grep -E "[: ]${port}\\b" >/dev/null 2>&1 && ok "Listening on port ${port}" || warn "Not listening on port ${port}"
   elif have_cmd netstat; then
-    netstat -lntp 2>/dev/null | grep -E "[:.]${port}\b" >/dev/null 2>&1 && ok "Listening on port ${port}" || warn "Not listening on port ${port}"
+    netstat -lntp 2>/dev/null | grep -E "[:.]${port}\\b" >/dev/null 2>&1 && ok "Listening on port ${port}" || warn "Not listening on port ${port}"
   fi
 
-  curl -fsS "http://127.0.0.1:${port}/tunnel" >/dev/null 2>&1 && ok "HTTP endpoint responds" || warn "HTTP endpoint probe failed (may still be OK if it expects framed traffic)"
+  # Try to detect fake_path from yaml (best-effort, no full YAML parser)
+  local fake_path="/tunnel"
+  if [[ -f "$cfg" ]]; then
+    local fp
+    fp="$(grep -E '^\\\s*fake_path:' "$cfg" 2>/dev/null | head -n1 | awk -F: '{print $2}' | tr -d ' "\\r' || true)"
+    if [[ -n "$fp" ]]; then
+      [[ "$fp" == /* ]] || fp="/$fp"
+      fake_path="$fp"
+    fi
+  fi
+
+  # Probe (POST) both fake_path and /tunnel
+  curl -fsS -X POST "http://127.0.0.1:${port}${fake_path}" -o /dev/null 2>&1 \
+    && ok "HTTP tunnel endpoint responds (${fake_path})" \
+    || warn "Tunnel endpoint probe failed (${fake_path}) (may still be OK if it expects framed traffic)"
+
+  if [[ "$fake_path" != "/tunnel" ]]; then
+    curl -fsS -X POST "http://127.0.0.1:${port}/tunnel" -o /dev/null 2>&1 \
+      && ok "Fallback endpoint responds (/tunnel)" \
+      || warn "Fallback endpoint probe failed (/tunnel)"
+  fi
 }
 
 health_check_client() {

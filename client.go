@@ -16,49 +16,79 @@ type Client struct {
 	Transport *HTTPMuxTransport
 }
 
-func NewClient(serverURL, sessionID string, mimic *MimicConfig, obfs *ObfsConfig, psk string) *Client {
+// NewClientFromPath creates a client based on a single Dagger-like path config.
+// For httpmux: plain HTTP (no TLS) + Host spoofing + mimic headers.
+// For httpsmux: TLS (uTLS) + HTTP/2.
+func NewClientFromPath(path PathConfig, sessionID string, mimic *MimicConfig, obfs *ObfsConfig, psk string) *Client {
 	if mimic == nil {
 		mimic = &MimicConfig{}
 	}
-	serverURL = normalizeServerURL(serverURL, mimic)
+	if obfs == nil {
+		obfs = &ObfsConfig{}
+	}
 
-	pool := 3
+	transport := strings.ToLower(strings.TrimSpace(path.Transport))
+	addr := strings.TrimSpace(path.Addr)
+
+	// sensible defaults like Dagger
+	pool := path.ConnectionPool
+	if pool <= 0 {
+		pool = 2
+	}
+	dialTimeout := time.Duration(path.DialTimeout) * time.Second
+	if dialTimeout <= 0 {
+		dialTimeout = 10 * time.Second
+	}
+
+	serverURL := buildServerURL(transport, addr, mimic)
+
 	conns := make([]*HTTPConn, pool)
-
 	for i := 0; i < pool; i++ {
-		// کانفیگ اختصاصی uTLS برای شبیه‌سازی مرورگر
-		tr := &http.Transport{
-			DialTLSContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
-				// 1. اتصال TCP معمولی
-				rawConn, err := net.DialTimeout(network, addr, 10*time.Second)
-				if err != nil {
-					return nil, err
-				}
+		var tr *http.Transport
 
-				// 2. تعیین SNI
-				serverName := mimic.FakeDomain
-				if serverName == "" {
-					host, _, _ := net.SplitHostPort(addr)
-					serverName = host
-				}
+		// httpmux: plain HTTP mimicry
+		if transport == "httpmux" || transport == "wsmux" || transport == "tcpmux" || transport == "" {
+			dialer := &net.Dialer{Timeout: dialTimeout, KeepAlive: 30 * time.Second}
+			tr = &http.Transport{
+				DialContext:           dialer.DialContext,
+				DisableCompression:    false,
+				ForceAttemptHTTP2:     false, // keep it HTTP/1.1-like
+				MaxIdleConns:          1024,
+				MaxIdleConnsPerHost:   256,
+				IdleConnTimeout:       90 * time.Second,
+				TLSHandshakeTimeout:   dialTimeout,
+				ExpectContinueTimeout: 1 * time.Second,
+			}
+		} else {
+			// httpsmux / wssmux: TLS mimicry (uTLS) + HTTP/2
+			tr = &http.Transport{
+				DialTLSContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+					rawConn, err := net.DialTimeout(network, addr, dialTimeout)
+					if err != nil {
+						return nil, err
+					}
 
-				// 3. هندشیک با uTLS (Chrome 120)
-				uConn := utls.UClient(rawConn, &utls.Config{
-					ServerName:         serverName,
-					InsecureSkipVerify: true, // برای سرتیفیکیت‌های خودامضا
-				}, utls.HelloChrome_120)
+					serverName := mimic.FakeDomain
+					if serverName == "" {
+						host, _, _ := net.SplitHostPort(addr)
+						serverName = host
+					}
 
-				if err := uConn.Handshake(); err != nil {
-					_ = uConn.Close()
-					return nil, err
-				}
-				return uConn, nil
-			},
-			ForceAttemptHTTP2: true, // اجبار به HTTP/2 برای شباهت بیشتر
+					uConn := utls.UClient(rawConn, &utls.Config{
+						ServerName:         serverName,
+						InsecureSkipVerify: true, // allow self-signed
+					}, utls.HelloChrome_120)
+
+					if err := uConn.Handshake(); err != nil {
+						_ = uConn.Close()
+						return nil, err
+					}
+					return uConn, nil
+				},
+				ForceAttemptHTTP2: true,
+			}
+			_ = http2.ConfigureTransport(tr)
 		}
-
-		// تنظیم HTTP2 روی Transport
-		_ = http2.ConfigureTransport(tr)
 
 		conns[i] = &HTTPConn{
 			Client: &http.Client{
@@ -83,8 +113,27 @@ func NewClient(serverURL, sessionID string, mimic *MimicConfig, obfs *ObfsConfig
 	return &Client{Transport: mt}
 }
 
-// normalizeServerURL ensures the URL has a path (Dagger-style).
-// If user passes only "http(s)://host:port" we will append mimic.fake_path (default: /tunnel).
+func buildServerURL(transport, addr string, mimic *MimicConfig) string {
+	addr = strings.TrimSpace(addr)
+	if addr == "" {
+		return ""
+	}
+
+	// addr may be "1.2.3.4:2020" (Dagger-style) or a full URL.
+	if strings.Contains(addr, "://") {
+		return normalizeServerURL(addr, mimic)
+	}
+
+	scheme := "http"
+	switch strings.ToLower(strings.TrimSpace(transport)) {
+	case "httpsmux", "wssmux":
+		scheme = "https"
+	}
+	return normalizeServerURL(scheme+"://"+addr, mimic)
+}
+
+// normalizeServerURL ensures URL has a path (Dagger-style).
+// If user passes only "http(s)://host:port" we append mimic.fake_path (default: /tunnel).
 func normalizeServerURL(raw string, mimic *MimicConfig) string {
 	raw = strings.TrimSpace(raw)
 	if raw == "" {

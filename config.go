@@ -7,6 +7,13 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
+// Config is the unified runtime config for RsTunnel (picotun).
+// It supports BOTH:
+//   - Native RsTunnel keys (server_url, forward.tcp/udp, mimic/obfs)
+//   - DaggerConnect-compatible keys (paths, maps, http_mimic, obfuscation, advanced)
+//
+// NOTE: For client mode, Dagger-style "paths" is preferred (multi-path). For backward
+// compatibility, "server_url" is also accepted.
 type Config struct {
 	// Common
 	Mode    string `yaml:"mode"` // server|client
@@ -15,37 +22,44 @@ type Config struct {
 	Verbose bool   `yaml:"verbose"`
 
 	// Server
-	Listen     string `yaml:"listen"` // e.g. 0.0.0.0:2020
-	Transport  string `yaml:"transport"`
-	Heartbeat  int    `yaml:"heartbeat"`
-	SessionTimeout int `yaml:"session_timeout"` // seconds (fallback if advanced.session_timeout exists)
+	Listen         string `yaml:"listen"` // e.g. 0.0.0.0:2020
+	Transport      string `yaml:"transport"`
+	Heartbeat      int    `yaml:"heartbeat"`
+	SessionTimeout int    `yaml:"session_timeout"` // seconds (fallback if advanced.session_timeout exists)
 
-	// Client
+	// Client (legacy single-url mode)
 	ServerURL string `yaml:"server_url"` // full URL e.g. http://1.2.3.4:2020/search
 	SessionID string `yaml:"session_id"`
 
-	// Unified runtime configs (internal)
+	// Dagger-style client paths (recommended)
+	Paths []PathConfig `yaml:"paths"`
+
+	// Unified runtime configs
 	Mimic MimicConfig `yaml:"mimic"`
 	Obfs  ObfsConfig  `yaml:"obfs"`
 
+	// Legacy forward mappings (native RsTunnel)
 	Forward struct {
 		TCP []string `yaml:"tcp"` // ["0.0.0.0:1457->127.0.0.1:1457"]
 		UDP []string `yaml:"udp"`
 	} `yaml:"forward"`
 }
 
+// PathConfig is a Dagger-like "connection path".
+type PathConfig struct {
+	Transport      string `yaml:"transport"`        // httpmux/httpsmux/wsmux/...
+	Addr           string `yaml:"addr"`             // host:port (no scheme)
+	ConnectionPool int    `yaml:"connection_pool"`  // default 2
+	AggressivePool bool   `yaml:"aggressive_pool"`  // default false
+	RetryInterval  int    `yaml:"retry_interval"`   // seconds
+	DialTimeout    int    `yaml:"dial_timeout"`     // seconds
+}
+
 // ------------------------------
 // Dagger-style YAML compatibility
 // ------------------------------
 
-type daggerPath struct {
-	Transport       string `yaml:"transport"`
-	Addr            string `yaml:"addr"`
-	ConnectionPool  int    `yaml:"connection_pool"`
-	AggressivePool  bool   `yaml:"aggressive_pool"`
-	RetryInterval   int    `yaml:"retry_interval"`
-	DialTimeout     int    `yaml:"dial_timeout"`
-}
+type daggerPath = PathConfig
 
 type daggerMap struct {
 	Type   string `yaml:"type"`   // tcp|udp|both
@@ -92,7 +106,7 @@ type daggerConfig struct {
 	HTTPMimic   daggerHTTPMimic `yaml:"http_mimic"`
 	Advanced    daggerAdvanced  `yaml:"advanced"`
 
-	// Accept older keys if present
+	// Accept native keys if present
 	Mimic MimicConfig `yaml:"mimic"`
 	Obfs  ObfsConfig  `yaml:"obfs"`
 
@@ -100,9 +114,10 @@ type daggerConfig struct {
 		TCP []string `yaml:"tcp"`
 		UDP []string `yaml:"udp"`
 	} `yaml:"forward"`
-	ServerURL string `yaml:"server_url"`
-	SessionID string `yaml:"session_id"`
-	SessionTimeout int `yaml:"session_timeout"`
+
+	ServerURL      string `yaml:"server_url"`
+	SessionID      string `yaml:"session_id"`
+	SessionTimeout int    `yaml:"session_timeout"`
 }
 
 func normalizePath(p string) string {
@@ -122,27 +137,32 @@ func LoadConfig(path string) (*Config, error) {
 		return nil, err
 	}
 
-	// First unmarshal into daggerConfig (superset)
+	// Unmarshal superset
 	var dc daggerConfig
 	if err := yaml.Unmarshal(b, &dc); err != nil {
 		return nil, err
 	}
 
-	// If Dagger-style keys exist, convert to internal Config
+	// Detect whether dagger-style keys are being used
 	useDaggerStyle := false
-	if dc.HTTPMimic.FakeDomain != "" || dc.HTTPMimic.FakePath != "" || len(dc.Paths) > 0 || len(dc.Maps) > 0 || dc.Obfuscation.Enabled {
+	if dc.HTTPMimic.FakeDomain != "" ||
+		dc.HTTPMimic.FakePath != "" ||
+		len(dc.Paths) > 0 ||
+		len(dc.Maps) > 0 ||
+		dc.Obfuscation.Enabled {
 		useDaggerStyle = true
 	}
 
 	var c Config
 	if useDaggerStyle {
-		c.Mode = dc.Mode
+		c.Mode = strings.TrimSpace(dc.Mode)
 		c.PSK = dc.PSK
 		c.Profile = dc.Profile
 		c.Verbose = dc.Verbose
 		c.Listen = dc.Listen
 		c.Transport = dc.Transport
 		c.Heartbeat = dc.Heartbeat
+		c.Paths = dc.Paths
 
 		// Session timeout: advanced.session_timeout > session_timeout > default
 		if dc.Advanced.SessionTimeout > 0 {
@@ -153,9 +173,9 @@ func LoadConfig(path string) (*Config, error) {
 			c.SessionTimeout = 15
 		}
 
-		// Mimic
+		// Mimic (Dagger keys)
 		c.Mimic.FakeDomain = dc.HTTPMimic.FakeDomain
-		c.Mimic.FakePath = dc.HTTPMimic.FakePath
+		c.Mimic.FakePath = normalizePath(dc.HTTPMimic.FakePath)
 		c.Mimic.UserAgent = dc.HTTPMimic.UserAgent
 		c.Mimic.CustomHeaders = dc.HTTPMimic.CustomHeaders
 		c.Mimic.SessionCookie = dc.HTTPMimic.SessionCookie
@@ -167,9 +187,8 @@ func LoadConfig(path string) (*Config, error) {
 		c.Obfs.MaxPadding = dc.Obfuscation.MaxPadding
 		c.Obfs.MinDelayMS = dc.Obfuscation.MinDelayMS
 		c.Obfs.MaxDelayMS = dc.Obfuscation.MaxDelayMS
-		c.Obfs.BurstChance = int(dc.Obfuscation.BurstChance * 1000) // legacy expects int; we store scaled
-		// NOTE: BurstChance in ObfsConfig is int in current code; interpret as 0..1000
-		// We'll keep it consistent with existing ApplyObfuscation implementation.
+		// ObfsConfig.BurstChance is an int (0..1000) in current code
+		c.Obfs.BurstChance = int(dc.Obfuscation.BurstChance * 1000)
 
 		// Maps => Forward
 		for _, m := range dc.Maps {
@@ -188,32 +207,54 @@ func LoadConfig(path string) (*Config, error) {
 			case "both":
 				c.Forward.TCP = append(c.Forward.TCP, entry)
 				c.Forward.UDP = append(c.Forward.UDP, entry)
+			default:
+				// default to tcp
+				c.Forward.TCP = append(c.Forward.TCP, entry)
 			}
 		}
 
-		// Paths => ServerURL (use first path)
-		if len(dc.Paths) > 0 {
-			addr := strings.TrimSpace(dc.Paths[0].Addr)
-			p := normalizePath(dc.HTTPMimic.FakePath)
-			if p == "" {
-				p = "/tunnel"
-			}
-			if addr != "" {
-				c.ServerURL = "http://" + addr + p
-			}
+		// Legacy fallbacks (if user provided native keys too)
+		if dc.Mimic.FakeDomain != "" || dc.Mimic.FakePath != "" {
+			c.Mimic = dc.Mimic
+			c.Mimic.FakePath = normalizePath(c.Mimic.FakePath)
 		}
-		c.SessionID = dc.SessionID
+		if dc.Obfs.Enabled {
+			c.Obfs = dc.Obfs
+		}
+		if len(dc.Forward.TCP) > 0 || len(dc.Forward.UDP) > 0 {
+			c.Forward = dc.Forward
+		}
+
+		// client legacy single-url (optional)
+		c.ServerURL = strings.TrimSpace(dc.ServerURL)
+		c.SessionID = strings.TrimSpace(dc.SessionID)
 		if c.SessionID == "" {
-			c.SessionID = "sess"
+			c.SessionID = "sess-default"
 		}
-
 		return &c, nil
 	}
 
-	// Fallback: old format
-	var legacy Config
-	if err := yaml.Unmarshal(b, &legacy); err != nil {
-		return nil, err
+	// Native mode (not Dagger style)
+	c.Mode = strings.TrimSpace(dc.Mode)
+	c.PSK = dc.PSK
+	c.Profile = dc.Profile
+	c.Verbose = dc.Verbose
+	c.Listen = dc.Listen
+	c.Transport = dc.Transport
+	c.Heartbeat = dc.Heartbeat
+	c.SessionTimeout = dc.SessionTimeout
+	c.ServerURL = strings.TrimSpace(dc.ServerURL)
+	c.SessionID = strings.TrimSpace(dc.SessionID)
+	if c.SessionID == "" {
+		c.SessionID = "sess-default"
 	}
-	return &legacy, nil
+	c.Mimic = dc.Mimic
+	c.Mimic.FakePath = normalizePath(c.Mimic.FakePath)
+	c.Obfs = dc.Obfs
+	c.Forward = dc.Forward
+	c.Paths = dc.Paths
+	if c.SessionTimeout <= 0 {
+		c.SessionTimeout = 15
+	}
+	return &c, nil
 }

@@ -46,15 +46,7 @@ func main() {
 		}
 		srv := httpmux.NewServer(cfg.SessionTimeout, &cfg.Mimic, &cfg.Obfs, cfg.PSK)
 
-		// maps from new schema
-		for _, m := range cfg.Maps {
-			if strings.ToLower(m.Type) == "tcp" {
-				go srv.StartReverseTCP(m.Bind, m.Target)
-			} else if strings.ToLower(m.Type) == "udp" {
-				go srv.StartReverseUDP(m.Bind, m.Target)
-			}
-		}
-		// maps from legacy schema
+		// Reverse TCP/UDP listeners (Dagger "maps" are converted into Forward by LoadConfig)
 		for _, m := range cfg.Forward.TCP {
 			bind, target, ok := splitMapLegacy(m)
 			if ok {
@@ -68,27 +60,56 @@ func main() {
 			}
 		}
 
-		mux := http.NewServeMux()
-		mux.HandleFunc("/tunnel", srv.HandleHTTP)
+		// Tunnel endpoint should match mimic.fake_path; keep /tunnel too.
+		path := strings.TrimSpace(cfg.Mimic.FakePath)
+		if path == "" || path == "/" {
+			path = "/tunnel"
+		}
+		if !strings.HasPrefix(path, "/") {
+			path = "/" + path
+		}
 
-		log.Printf("server listening on %s (tunnel endpoint: /tunnel)", cfg.Listen)
+		mux := http.NewServeMux()
+		mux.HandleFunc(path, srv.HandleHTTP)
+		if path != "/tunnel" {
+			mux.HandleFunc("/tunnel", srv.HandleHTTP)
+		}
+
+		log.Printf("server listening on %s (tunnel endpoint: %s)", cfg.Listen, path)
 		log.Fatal(http.ListenAndServe(cfg.Listen, mux))
 
 	case "client":
-		if cfg.ServerURL == "" {
-			log.Fatal("server_url is required")
-		}
 		if cfg.SessionID == "" {
 			cfg.SessionID = "sess-default"
 		}
-		cl := httpmux.NewClient(cfg.ServerURL, cfg.SessionID, &cfg.Mimic, &cfg.Obfs, cfg.PSK)
+
+		// Prefer Dagger-style paths
+		var path httpmux.PathConfig
+		if len(cfg.Paths) > 0 {
+			path = cfg.Paths[0]
+		} else {
+			if strings.TrimSpace(cfg.ServerURL) == "" {
+				log.Fatal("client requires either 'paths:' or 'server_url:'")
+			}
+			path = httpmux.PathConfig{
+				Transport:      "httpmux",
+				Addr:           cfg.ServerURL,
+				ConnectionPool: 2,
+				AggressivePool: true,
+				RetryInterval:  3,
+				DialTimeout:    10,
+			}
+		}
+
+		cl := httpmux.NewClientFromPath(path, cfg.SessionID, &cfg.Mimic, &cfg.Obfs, cfg.PSK)
 		rev := httpmux.NewClientReverse(cl.Transport)
 		go rev.Run()
 
-		log.Printf("client started. server_url=%s session_id=%s", cfg.ServerURL, cfg.SessionID)
+		log.Printf("client started. transport=%s addr=%s session_id=%s", path.Transport, path.Addr, cfg.SessionID)
 		for {
 			time.Sleep(60 * time.Second)
 		}
+
 	default:
 		log.Fatalf("unknown mode: %q (expected server/client)", cfg.Mode)
 	}
@@ -101,6 +122,8 @@ func splitMapLegacy(s string) (bind string, target string, ok bool) {
 	}
 	bind = strings.TrimSpace(parts[0])
 	target = strings.TrimSpace(parts[1])
+
+	// if bind is only port "1412" -> "0.0.0.0:1412"
 	if !strings.Contains(bind, ":") {
 		bind = "0.0.0.0:" + bind
 	}

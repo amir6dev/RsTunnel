@@ -42,8 +42,11 @@ func (s *Server) getActiveSession() *Session {
 func (s *Server) HandleHTTP(w http.ResponseWriter, r *http.Request) {
 	// 1. Session Handling
 	sessionID := extractSessionID(r)
-	if _, err := r.Cookie("SESSION"); err != nil {
-		http.SetCookie(w, &http.Cookie{Name: "SESSION", Value: sessionID, Path: "/"})
+	// Respect Dagger-style http_mimic.session_cookie (default: true in installer)
+	if s.Mimic != nil && s.Mimic.SessionCookie {
+		if _, err := r.Cookie("SESSION"); err != nil {
+			http.SetCookie(w, &http.Cookie{Name: "SESSION", Value: sessionID, Path: "/"})
+		}
 	}
 	sess := s.SessionMgr.GetOrCreate(sessionID)
 	s.setActiveSession(sess)
