@@ -2,7 +2,7 @@
 set -euo pipefail
 
 # =========================
-# PicoTun Installer (Auto-Build)
+# PicoTun Manager (Full Automation)
 # =========================
 REPO_DEFAULT="amir6dev/RsTunnel"
 BINARY_NAME="picotun"
@@ -30,7 +30,6 @@ need_root() {
     fi
 }
 
-# --- Core Installation Logic ---
 install_core() {
     print_msg "Checking environment..."
     apt-get update -qq >/dev/null
@@ -38,7 +37,6 @@ install_core() {
 
     print_msg "Cloning source code..."
     rm -rf /tmp/picobuild
-    # دانلود کل ریپوزیتوری
     git clone "https://github.com/${REPO_DEFAULT}.git" /tmp/picobuild
     
     if [ ! -d "/tmp/picobuild" ]; then
@@ -48,25 +46,22 @@ install_core() {
 
     cd /tmp/picobuild || exit
 
-    # تشخیص پوشه پروژه (اگر فایل‌ها داخل PicoTun باشند)
-    if [ -d "PicoTun" ]; then
-        cd PicoTun
-    fi
+    # اگر فایل‌ها داخل پوشه PicoTun هستند، وارد شو
+    if [ -d "PicoTun" ]; then cd PicoTun; fi
 
-    # حل مشکل وابستگی‌ها
+    # حل وابستگی‌ها
     if [ -f "go.mod" ]; then
         print_msg "Resolving dependencies (go mod tidy)..."
         go mod tidy
     fi
 
-    # پیدا کردن مسیر فایل اصلی برای بیلد
+    # پیدا کردن مسیر فایل اصلی
     TARGET=""
     if [ -f "cmd/picotun/main.go" ]; then TARGET="cmd/picotun/main.go"; fi
     if [ -f "main.go" ]; then TARGET="main.go"; fi
     
     if [ -z "$TARGET" ]; then
         print_err "Could not find main.go to build!"
-        echo "Current dir files:"
         ls -R
         exit 1
     fi
@@ -85,7 +80,6 @@ install_core() {
     fi
 }
 
-# --- Configuration Wizard ---
 configure_wizard() {
     MODE=$1
     mkdir -p "$CONFIG_DIR"
@@ -165,7 +159,6 @@ EOF
     print_ok "Service Started!"
 }
 
-# --- Service Management ---
 manage_menu() {
     while true; do
         echo -e "\n${YELLOW}:: Service Management ::${NC}"
@@ -197,12 +190,10 @@ uninstall_all() {
     print_ok "Uninstalled."
 }
 
-# --- Main Menu ---
 main_menu() {
     need_root
     while true; do
         print_header
-        echo -e "${CYAN}   PicoTun Setup Manager   ${NC}"
         echo "1) Install / Update Core"
         echo "2) Configure Server"
         echo "3) Configure Client"
