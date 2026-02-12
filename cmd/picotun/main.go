@@ -6,7 +6,7 @@ import (
 	"net/http"
 	"strings"
 
-	// ✅ فیکس: مسیر درست پکیج طبق go.mod
+	// ✅ فیکس: مسیر دقیق پکیج
 	"github.com/amir6dev/rstunnel/PicoTun"
 )
 
@@ -14,10 +14,7 @@ func main() {
 	configPath := flag.String("config", "/etc/picotun/config.yaml", "Path to config")
 	flag.Parse()
 
-	// توجه: اینجا پکیج ایمپورت شده PicoTun نامیده شده چون پوشه آن PicoTun است
-	// اگر نام پکیج داخل فایل‌های Go "httpmux" است، باید alias تعریف کنید:
-	// import httpmux "github.com/amir6dev/rstunnel/PicoTun"
-	
+	// چون نام پکیج داخل فایل‌های PicoTun "httpmux" است، باید با httpmux صدا بزنیم
 	cfg, err := httpmux.LoadConfig(*configPath)
 	if err != nil { log.Fatalf("Config error: %v", err) }
 	
@@ -31,6 +28,7 @@ func main() {
 func runServer(cfg *httpmux.Config) {
 	if cfg.Listen == "" { cfg.Listen = "0.0.0.0:1010" }
 	
+	// سرور با تایم‌اوت طولانی‌تر برای هماهنگی با Long-Polling
 	srv := httpmux.NewServer(cfg.SessionTimeout, &cfg.Mimic, &cfg.Obfs, cfg.PSK)
 
 	if cfg.Forward != nil {
@@ -41,7 +39,7 @@ func runServer(cfg *httpmux.Config) {
 	}
 
 	http.HandleFunc("/tunnel", srv.HandleHTTP)
-	log.Printf("🔥 Server running on %s", cfg.Listen)
+	log.Printf("🔥 Server running on %s (Long-Polling Active)", cfg.Listen)
 	log.Fatal(http.ListenAndServe(cfg.Listen, nil))
 }
 

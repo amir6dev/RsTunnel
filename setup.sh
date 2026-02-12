@@ -165,7 +165,6 @@ EOF
     print_ok "Service Restarted"
 }
 
-# --- Service Management Menu ---
 manage_menu() {
     while true; do
         print_header
@@ -191,10 +190,9 @@ manage_menu() {
     done
 }
 
-# --- Full Uninstall ---
 uninstall_all() {
     echo ""
-    read -p "Are you sure you want to DELETE everything (Service, Configs, Binary)? (y/N): " yn
+    read -p "Are you sure you want to DELETE everything? (y/N): " yn
     if [[ "$yn" =~ ^[Yy] ]]; then
         print_msg "Uninstalling..."
         systemctl stop picotun >/dev/null 2>&1 || true
@@ -207,7 +205,6 @@ uninstall_all() {
     fi
 }
 
-# --- Main Menu ---
 main_menu() {
     while true; do
         print_header

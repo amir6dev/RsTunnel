@@ -33,21 +33,19 @@ func (s *Server) StartReverseTCP(bindAddr, targetAddr string) {
 }
 
 func (s *Server) handleInboundTCP(c net.Conn, target string) {
-	// ✅ فیکس: دریافت سشن فعال فعلی
+	// ✅ فیکس: دریافت سشن فعال فعلی (دیگر Global نیست)
 	sess := s.getActiveSession()
 	if sess == nil {
-		c.Close() // هیچ کلاینتی وصل نیست
+		c.Close()
 		return
 	}
 
 	id := atomic.AddUint32(&nextStreamID, 2)
 	
-	// ثبت کانکشن
 	serverLinksMu.Lock()
 	serverLinks[id] = &tcpLink{c: c}
 	serverLinksMu.Unlock()
 
-	// ارسال درخواست باز شدن سوکت به کلاینت
 	select {
 	case sess.Outgoing <- &Frame{
 		StreamID: id,
@@ -56,6 +54,6 @@ func (s *Server) handleInboundTCP(c net.Conn, target string) {
 		Payload:  []byte(target),
 	}:
 	default:
-		c.Close() // صف پر است
+		c.Close()
 	}
 }

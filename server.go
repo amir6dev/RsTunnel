@@ -13,10 +13,8 @@ type Server struct {
 	Mimic         *MimicConfig
 	Obfs          *ObfsConfig
 	PSK           string
-	
-	// مدیریت سشن فعال برای Reverse Tunnel
-	activeSessMu sync.RWMutex
-	activeSess   *Session
+	activeSessMu  sync.RWMutex
+	activeSess    *Session
 }
 
 func NewServer(timeoutSec int, mimic *MimicConfig, obfs *ObfsConfig, psk string) *Server {
@@ -29,7 +27,6 @@ func NewServer(timeoutSec int, mimic *MimicConfig, obfs *ObfsConfig, psk string)
 	}
 }
 
-// ثبت سشن فعال برای دریافت ترافیک Reverse
 func (s *Server) setActiveSession(sess *Session) {
 	s.activeSessMu.Lock()
 	defer s.activeSessMu.Unlock()
@@ -43,52 +40,63 @@ func (s *Server) getActiveSession() *Session {
 }
 
 func (s *Server) HandleHTTP(w http.ResponseWriter, r *http.Request) {
+	// 1. Session Handling
 	sessionID := extractSessionID(r)
 	if _, err := r.Cookie("SESSION"); err != nil {
 		http.SetCookie(w, &http.Cookie{Name: "SESSION", Value: sessionID, Path: "/"})
 	}
-
 	sess := s.SessionMgr.GetOrCreate(sessionID)
-	
-	// ✅ فیکس: آپدیت کردن سشن فعال به آخرین کلاینت متصل شده
 	s.setActiveSession(sess)
 
+	// 2. Read Request (Inbound Data)
 	reqBody, _ := io.ReadAll(r.Body)
 	_ = r.Body.Close()
 
-	// Decrypt Logic
-	reqBody = StripObfuscation(reqBody, s.Obfs)
-	plain, err := DecryptPSK(reqBody, s.PSK)
-	if err != nil {
-		// ✅ فیکس: اگر رمز اشتباه بود، ارور 403 بده و قطع کن (جلوگیری از Flood)
-		http.Error(w, "Forbidden", 403)
-		return
-	}
-
-	reader := bytes.NewReader(plain)
-	for {
-		fr, err := ReadFrame(reader)
-		if err != nil { break }
-		s.handleFrame(sess, fr)
-	}
-
-	// Drain Outgoing Frames
-	var out bytes.Buffer
-	max := 128
-	for i := 0; i < max; i++ {
-		select {
-		case fr := <-sess.Outgoing:
-			_ = WriteFrame(&out, fr)
-		default:
-			i = max
+	if len(reqBody) > 0 {
+		reqBody = StripObfuscation(reqBody, s.Obfs)
+		plain, err := DecryptPSK(reqBody, s.PSK)
+		if err == nil {
+			reader := bytes.NewReader(plain)
+			for {
+				fr, err := ReadFrame(reader)
+				if err != nil { break }
+				s.handleFrame(sess, fr)
+			}
 		}
 	}
 
-	enc, err := EncryptPSK(out.Bytes(), s.PSK)
-	if err != nil { return }
-	
+	// 3. Long-Polling Logic (Outbound Data)
+	var out bytes.Buffer
+
+	// گام اول: انتظار برای حداقل یک فریم (Blocking Wait)
+	// اگر صف خالی بود، تا 20 ثانیه صبر می‌کند
+	select {
+	case fr := <-sess.Outgoing:
+		_ = WriteFrame(&out, fr)
+	case <-time.After(20 * time.Second):
+		// Timeout: هیچ دیتایی نبود، پاسخ خالی (Heartbeat) بفرست
+	}
+
+	// گام دوم: اگر دیتایی آمد، بقیه فریم‌های موجود را هم سریع بچسبان (Batching)
+	if out.Len() > 0 {
+		maxBatch := 128
+		for i := 0; i < maxBatch; i++ {
+			select {
+			case fr := <-sess.Outgoing:
+				_ = WriteFrame(&out, fr)
+			default:
+				i = maxBatch // خروج از حلقه اگر دیتایی نیست
+			}
+		}
+	}
+
+	// 4. Encrypt & Send Response
+	// حتی اگر out خالی باشد، باید پاسخ رمزنگاری شده (شامل Padding) برود
+	enc, _ := EncryptPSK(out.Bytes(), s.PSK)
 	resp := ApplyObfuscation(enc, s.Obfs)
 	ApplyDelay(s.Obfs)
+	
+	w.Header().Set("Content-Type", "application/octet-stream")
 	w.Write(resp)
 }
 
