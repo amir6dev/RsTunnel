@@ -25,10 +25,9 @@ type HTTPConn struct {
 	SessionID string
 	ServerURL string
 
-	// Path-level behaviors (Dagger-like)
-	RetryInterval time.Duration // per-path retry interval
-	Aggressive    bool          // aggressive_pool
-	nextTryNS     int64         // unix nano; internal cooldown timestamp
+	RetryInterval time.Duration
+	Aggressive    bool
+	nextTryNS     int64
 }
 
 func (hc *HTTPConn) canTry(now time.Time) bool {
@@ -41,26 +40,19 @@ func (hc *HTTPConn) markFail(now time.Time) {
 	if ri <= 0 {
 		ri = 3 * time.Second
 	}
-	// aggressive pool retries faster
-	if hc.Aggressive {
-		if ri > 500*time.Millisecond {
-			ri = 500 * time.Millisecond
-		}
+	if hc.Aggressive && ri > 500*time.Millisecond {
+		ri = 500 * time.Millisecond
 	}
 	atomic.StoreInt64(&hc.nextTryNS, now.Add(ri).UnixNano())
 }
 
-func (hc *HTTPConn) markOK() {
-	atomic.StoreInt64(&hc.nextTryNS, 0)
-}
+func (hc *HTTPConn) markOK() { atomic.StoreInt64(&hc.nextTryNS, 0) }
 
 func (hc *HTTPConn) RoundTrip(payload []byte) ([]byte, error) {
-(payload []byte) ([]byte, error) {
 	if hc.Client == nil {
 		hc.Client = &http.Client{Timeout: 25 * time.Second}
 	}
 
-	// Encrypt -> Obfs
 	enc, err := EncryptPSK(payload, hc.PSK)
 	if err != nil {
 		return nil, err
@@ -68,17 +60,14 @@ func (hc *HTTPConn) RoundTrip(payload []byte) ([]byte, error) {
 	enc = ApplyObfuscation(enc, hc.Obfs)
 	ApplyDelay(hc.Obfs)
 
-	body := bytes.NewReader(enc)
-	req, err := http.NewRequest("POST", hc.ServerURL, body)
+	req, err := http.NewRequest("POST", hc.ServerURL, bytes.NewReader(enc))
 	if err != nil {
 		return nil, err
 	}
-	// Dagger-style Host spoofing (connect to real host, send fake Host header)
 	if hc.Mimic != nil {
 		if hc.Mimic.FakeDomain != "" {
 			req.Host = hc.Mimic.FakeDomain
 		}
-		// If Chunked is enabled, force chunked transfer encoding (hide body size)
 		if hc.Mimic.Chunked {
 			req.ContentLength = -1
 		}
@@ -91,13 +80,9 @@ func (hc *HTTPConn) RoundTrip(payload []byte) ([]byte, error) {
 	}
 	defer resp.Body.Close()
 
-	// Capture Dagger-style session cookie for subsequent requests.
 	if hc.Mimic != nil && hc.Mimic.SessionCookie {
 		for _, c := range resp.Cookies() {
-			if c == nil {
-				continue
-			}
-			if c.Name == "session" && c.Value != "" {
+			if c != nil && c.Name == "session" && c.Value != "" {
 				hc.SessionID = c.Value
 				break
 			}
@@ -108,14 +93,8 @@ func (hc *HTTPConn) RoundTrip(payload []byte) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-
-	// Deobfs -> Decrypt
 	b = StripObfuscation(b, hc.Obfs)
-	plain, err := DecryptPSK(b, hc.PSK)
-	if err != nil {
-		return nil, err
-	}
-	return plain, nil
+	return DecryptPSK(b, hc.PSK)
 }
 
 type HTTPMuxConfig struct {
@@ -127,14 +106,11 @@ type HTTPMuxConfig struct {
 type HTTPMuxTransport struct {
 	conns []*HTTPConn
 	cfg   HTTPMuxConfig
-
-	out chan *Frame
-	in  chan *Frame
-
-	die chan struct{}
-	wg  sync.WaitGroup
-
-	rr uint32
+	out   chan *Frame
+	in    chan *Frame
+	die   chan struct{}
+	wg    sync.WaitGroup
+	rr    uint32
 }
 
 func NewHTTPMuxTransport(conns []*HTTPConn, cfg HTTPMuxConfig) *HTTPMuxTransport {
@@ -147,13 +123,7 @@ func NewHTTPMuxTransport(conns []*HTTPConn, cfg HTTPMuxConfig) *HTTPMuxTransport
 	if cfg.IdlePoll <= 0 {
 		cfg.IdlePoll = 250 * time.Millisecond
 	}
-	return &HTTPMuxTransport{
-		conns: conns,
-		cfg:   cfg,
-		out:   make(chan *Frame, 4096),
-		in:    make(chan *Frame, 4096),
-		die:   make(chan struct{}),
-	}
+	return &HTTPMuxTransport{conns: conns, cfg: cfg, out: make(chan *Frame, 4096), in: make(chan *Frame, 4096), die: make(chan struct{})}
 }
 
 func (t *HTTPMuxTransport) Start() error {
@@ -200,35 +170,27 @@ func (t *HTTPMuxTransport) pickConn() *HTTPConn {
 
 func (t *HTTPMuxTransport) loop() {
 	defer t.wg.Done()
-
 	flushTick := time.NewTicker(t.cfg.FlushInterval)
 	defer flushTick.Stop()
-
 	var batch []*Frame
 
 	flush := func() {
-		// request payload
 		var buf bytes.Buffer
 		for _, fr := range batch {
 			_ = WriteFrame(&buf, fr)
 		}
 		batch = batch[:0]
-
-		// idle poll: اگر چیزی برای ارسال نبود هم گهگاهی poll کن
 		if buf.Len() == 0 {
 			time.Sleep(t.cfg.IdlePoll)
 		}
 
-		// Try multiple conns (multi-path) before sleeping.
 		now := time.Now()
 		var (
 			resp []byte
 			err  error
 		)
-		tried := 0
-		for tried < len(t.conns) {
+		for tried := 0; tried < len(t.conns); tried++ {
 			conn := t.pickConn()
-			tried++
 			if conn != nil && !conn.canTry(now) {
 				continue
 			}
@@ -245,11 +207,7 @@ func (t *HTTPMuxTransport) loop() {
 			break
 		}
 		if err != nil {
-			// All conns failed; small sleep to avoid tight loop.
 			time.Sleep(250 * time.Millisecond)
-			return
-		}
-		if len(resp) == 0 {
 			return
 		}
 
@@ -271,13 +229,11 @@ func (t *HTTPMuxTransport) loop() {
 		select {
 		case <-t.die:
 			return
-
 		case fr := <-t.out:
 			batch = append(batch, fr)
 			if len(batch) >= t.cfg.MaxBatch {
 				flush()
 			}
-
 		case <-flushTick.C:
 			flush()
 		}

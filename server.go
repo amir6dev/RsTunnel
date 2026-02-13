@@ -10,30 +10,26 @@ import (
 )
 
 type Server struct {
-	SessionMgr    *SessionManager
-	Mimic         *MimicConfig
-	Obfs          *ObfsConfig
-	PSK           string
-	activeSessMu  sync.RWMutex
-	activeSess    *Session
+	SessionMgr   *SessionManager
+	Mimic        *MimicConfig
+	Obfs         *ObfsConfig
+	PSK          string
+	activeSessMu sync.RWMutex
+	activeSess   *Session
 }
 
 func NewServer(timeoutSec int, mimic *MimicConfig, obfs *ObfsConfig, psk string) *Server {
-	if timeoutSec <= 0 { timeoutSec = 15 }
-	return &Server{
-		SessionMgr: NewSessionManager(time.Duration(timeoutSec) * time.Second),
-		Mimic:      mimic,
-		Obfs:       obfs,
-		PSK:        psk,
+	if timeoutSec <= 0 {
+		timeoutSec = 15
 	}
+	return &Server{SessionMgr: NewSessionManager(time.Duration(timeoutSec) * time.Second), Mimic: mimic, Obfs: obfs, PSK: psk}
 }
 
 func (s *Server) setActiveSession(sess *Session) {
 	s.activeSessMu.Lock()
-	defer s.activeSessMu.Unlock()
 	s.activeSess = sess
+	s.activeSessMu.Unlock()
 }
-
 func (s *Server) getActiveSession() *Session {
 	s.activeSessMu.RLock()
 	defer s.activeSessMu.RUnlock()
@@ -41,36 +37,21 @@ func (s *Server) getActiveSession() *Session {
 }
 
 func (s *Server) HandleHTTP(w http.ResponseWriter, r *http.Request) {
-	// Dagger-like guard: if a fake_path is configured, only accept requests to that path
-	// as tunnel traffic. Everything else returns a decoy HTTP 200 with empty body.
 	if s.Mimic != nil && s.Mimic.FakePath != "" && r.URL.Path != s.Mimic.FakePath {
 		s.writeDecoyHTTP200(w, r)
 		return
 	}
 
-	// 1) Session Handling (Dagger uses cookie name "session")
 	sessionID := extractSessionID(r)
-<<<<<<< HEAD
 	if s.Mimic != nil && s.Mimic.SessionCookie {
-		if _, err := r.Cookie("session"); err != nil {
-			http.SetCookie(w, &http.Cookie{Name: "session", Value: sessionID, Path: "/", HttpOnly: true, SameSite: http.SameSiteLaxMode})
-=======
-	// Respect Dagger-style http_mimic.session_cookie (default: true in installer)
-	if s.Mimic != nil && s.Mimic.SessionCookie {
-		if _, err := r.Cookie("SESSION"); err != nil {
-			http.SetCookie(w, &http.Cookie{Name: "SESSION", Value: sessionID, Path: "/"})
->>>>>>> 761e0881dbe95042a42689a9d133dc400c8d6457
-		}
+		// rotate cookie every response to mimic Dagger behavior
+		http.SetCookie(w, &http.Cookie{Name: "session", Value: extractSessionID(r), Path: "/", HttpOnly: true, SameSite: http.SameSiteLaxMode})
 	}
 	sess := s.SessionMgr.GetOrCreate(sessionID)
 	s.setActiveSession(sess)
 
-	// 2) Read Request (Inbound Data)
 	reqBody, _ := io.ReadAll(r.Body)
 	_ = r.Body.Close()
-
-	// If body is empty or decrypt fails, behave like Dagger: decoy 200 with empty body.
-	// This is important for users probing with curl/wget or scanners.
 	if len(reqBody) == 0 {
 		s.writeDecoyHTTP200(w, r)
 		return
@@ -91,36 +72,26 @@ func (s *Server) HandleHTTP(w http.ResponseWriter, r *http.Request) {
 		s.handleFrame(sess, fr)
 	}
 
-	// 3. Long-Polling Logic (Outbound Data)
 	var out bytes.Buffer
-
-	// گام اول: انتظار برای حداقل یک فریم (Blocking Wait)
-	// اگر صف خالی بود، تا 20 ثانیه صبر می‌کند
 	select {
 	case fr := <-sess.Outgoing:
 		_ = WriteFrame(&out, fr)
 	case <-time.After(20 * time.Second):
-		// Timeout: هیچ دیتایی نبود، پاسخ خالی (Heartbeat) بفرست
 	}
-
-	// گام دوم: اگر دیتایی آمد، بقیه فریم‌های موجود را هم سریع بچسبان (Batching)
 	if out.Len() > 0 {
-		maxBatch := 128
-		for i := 0; i < maxBatch; i++ {
+		for i := 0; i < 128; i++ {
 			select {
 			case fr := <-sess.Outgoing:
 				_ = WriteFrame(&out, fr)
 			default:
-				i = maxBatch // خروج از حلقه اگر دیتایی نیست
+				i = 128
 			}
 		}
 	}
 
-	// 4) Encrypt & Send Response
 	enc, _ := EncryptPSK(out.Bytes(), s.PSK)
 	resp := ApplyObfuscation(enc, s.Obfs)
 	ApplyDelay(s.Obfs)
-
 	w.Header().Set("Content-Type", "application/octet-stream")
 	_, _ = w.Write(resp)
 }
@@ -133,7 +104,6 @@ func (s *Server) handleFrame(sess *Session, fr *Frame) {
 		default:
 		}
 	case FrameData:
-		// 1) TCP reverse links
 		serverLinksMu.Lock()
 		link := serverLinks[fr.StreamID]
 		serverLinksMu.Unlock()
@@ -141,8 +111,6 @@ func (s *Server) handleFrame(sess *Session, fr *Frame) {
 			_, _ = link.c.Write(fr.Payload)
 			return
 		}
-
-		// 2) UDP reverse links
 		serverUDPLinksMu.Lock()
 		ul := serverUDPLinks[fr.StreamID]
 		serverUDPLinksMu.Unlock()
@@ -150,7 +118,6 @@ func (s *Server) handleFrame(sess *Session, fr *Frame) {
 			_, _ = ul.ln.WriteToUDP(fr.Payload, ul.peer)
 		}
 	case FrameClose:
-		// TCP
 		serverLinksMu.Lock()
 		link := serverLinks[fr.StreamID]
 		delete(serverLinks, fr.StreamID)
@@ -159,8 +126,6 @@ func (s *Server) handleFrame(sess *Session, fr *Frame) {
 			_ = link.c.Close()
 			return
 		}
-
-		// UDP
 		serverUDPLinksMu.Lock()
 		ul := serverUDPLinks[fr.StreamID]
 		if ul != nil && ul.ln != nil && ul.peer != nil {
@@ -175,10 +140,7 @@ func extractSessionID(r *http.Request) string {
 	if c, _ := r.Cookie("session"); c != nil && c.Value != "" {
 		return c.Value
 	}
-	// Dagger's session cookie looks like 32 hex chars. We'll generate the same shape.
 	b := []byte(RandString(32))
-	// RandString returns base62-ish; convert to hex-looking bytes deterministically.
-	// This isn't cryptographic; it's only to blend in.
 	enc := make([]byte, hex.EncodedLen(len(b)))
 	hex.Encode(enc, b)
 	if len(enc) >= 32 {
@@ -187,22 +149,14 @@ func extractSessionID(r *http.Request) string {
 	return "sess-" + RandString(12)
 }
 
-// writeDecoyHTTP200 mimics the visible behavior of Dagger's httpmux when a request
-// doesn't look like tunnel traffic (e.g., curl). It returns 200 OK with empty body
-// and sets a "session" cookie.
 func (s *Server) writeDecoyHTTP200(w http.ResponseWriter, r *http.Request) {
-	// A few nginx-like headers commonly observed.
 	w.Header().Set("Server", "nginx/1.18.0")
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	w.Header().Set("Cache-Control", "private, max-age=0")
 	w.Header().Set("X-Frame-Options", "SAMEORIGIN")
 	w.Header().Set("X-Content-Type-Options", "nosniff")
-
 	if s.Mimic != nil && s.Mimic.SessionCookie {
-		if _, err := r.Cookie("session"); err != nil {
-			http.SetCookie(w, &http.Cookie{Name: "session", Value: extractSessionID(r), Path: "/", HttpOnly: true, SameSite: http.SameSiteLaxMode})
-		}
+		http.SetCookie(w, &http.Cookie{Name: "session", Value: extractSessionID(r), Path: "/", HttpOnly: true, SameSite: http.SameSiteLaxMode})
 	}
-
 	w.WriteHeader(http.StatusOK)
 }
