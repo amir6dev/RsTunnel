@@ -6,11 +6,11 @@ package httpmux
 import (
 	"bytes"
 	"context"
-	"crypto/rand"
+	crand "crypto/rand"
 	"encoding/hex"
 	"errors"
 	"io"
-	"math/rand"
+	mrand "math/rand"
 	"net/http"
 	"sync"
 	"sync/atomic"
@@ -22,7 +22,7 @@ import (
 // generateRandomSessionID creates a random session ID (like Dagger does)
 func generateRandomSessionID() string {
 	b := make([]byte, 16)
-	rand.Read(b)
+	_, _ = crand.Read(b)
 	return hex.EncodeToString(b)
 }
 
@@ -31,28 +31,28 @@ func GenerateFakeHTTPHeaders(cfg *MimicConfig, sessionID string) []byte {
 	if cfg == nil {
 		return nil
 	}
-	
+
 	headers := "POST /api/data HTTP/1.1\r\n"
-	
+
 	if cfg.FakeDomain != "" {
 		headers += "Host: " + cfg.FakeDomain + "\r\n"
 	}
-	
+
 	ua := cfg.UserAgent
 	if ua == "" {
 		ua = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
 	}
 	headers += "User-Agent: " + ua + "\r\n"
-	
+
 	headers += "Content-Type: application/octet-stream\r\n"
 	headers += "Accept-Encoding: gzip, deflate, br\r\n"
 	headers += "Accept-Language: en-US,en;q=0.9\r\n"
 	headers += "Connection: keep-alive\r\n"
-	
+
 	if sessionID != "" {
 		headers += "Cookie: session=" + sessionID + "\r\n"
 	}
-	
+
 	headers += "\r\n"
 	return []byte(headers)
 }
@@ -71,17 +71,17 @@ func stripFakeHeaders(data []byte) []byte {
 
 type HTTPConn struct {
 	CookieName string
-	Client    *http.Client
-	Mimic     *MimicConfig
-	Obfs      *ObfsConfig
-	PSK       string
-	SessionID string
-	ServerURL string
+	Client     *http.Client
+	Mimic      *MimicConfig
+	Obfs       *ObfsConfig
+	PSK        string
+	SessionID  string
+	ServerURL  string
 
 	RetryInterval time.Duration
 	Aggressive    bool
 	nextTryNS     int64
-	
+
 	// NEW: Enable fake header embedding
 	EmbedFakeHeaders bool
 }
@@ -117,8 +117,7 @@ func (hc *HTTPConn) RoundTrip(payload []byte) ([]byte, error) {
 	if hc.EmbedFakeHeaders && len(payload) > 0 {
 		fakeHeaders := GenerateFakeHTTPHeaders(hc.Mimic, hc.SessionID)
 		if len(fakeHeaders) > 0 {
-			payloadWithHeaders := append(fakeHeaders, payload...)
-			payload = payloadWithHeaders
+			payload = append(fakeHeaders, payload...)
 		}
 	}
 
@@ -152,31 +151,22 @@ func (hc *HTTPConn) RoundTrip(payload []byte) ([]byte, error) {
 	}
 	defer resp.Body.Close()
 
+	// FIX: unified cookie handling (no conflict markers)
 	if hc.Mimic != nil && hc.Mimic.SessionCookie {
 		for _, c := range resp.Cookies() {
-<<<<<<< HEAD
-<<<<<<< HEAD
-=======
->>>>>>> eac5513 (New Update)
 			if c == nil || c.Value == "" {
 				continue
 			}
-			// If we don't yet know the cookie name, adopt the first one we see.
+
+			// If cookie name is unknown, adopt first cookie we see
 			if hc.CookieName == "" {
 				hc.CookieName = c.Name
 				hc.SessionID = c.Value
 				break
 			}
+
+			// Otherwise only update if it's the expected cookie name
 			if c.Name == hc.CookieName {
-<<<<<<< HEAD
-=======
-			if c == nil {
-				continue
-			}
-			if c.Name == "session" && c.Value != "" {
->>>>>>> ce9c9960a462af1d2b04906222b2d63c6bdd40fd
-=======
->>>>>>> eac5513 (New Update)
 				hc.SessionID = c.Value
 				break
 			}
@@ -194,12 +184,12 @@ func (hc *HTTPConn) RoundTrip(payload []byte) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	
+
 	// NEW: Strip embedded fake headers if they exist
 	if hc.EmbedFakeHeaders {
 		plain = stripFakeHeaders(plain)
 	}
-	
+
 	return plain, nil
 }
 
@@ -209,7 +199,7 @@ type HTTPMuxConfig struct {
 	FlushInterval time.Duration
 	MaxBatch      int
 	IdlePoll      time.Duration
-	
+
 	// NEW: Dagger-like features
 	NumConnections   int           `yaml:"num_connections"`    // Number of parallel connections
 	EnableDecoy      bool          `yaml:"enable_decoy"`       // Enable fake GET requests
@@ -230,9 +220,9 @@ type HTTPMuxTransport struct {
 	wg  sync.WaitGroup
 
 	rr uint32
-	
+
 	sem chan struct{}
-	
+
 	// NEW: Decoy traffic control
 	decoyCancel context.CancelFunc
 }
@@ -247,13 +237,13 @@ func NewHTTPMuxTransport(conns []*HTTPConn, cfg HTTPMuxConfig) *HTTPMuxTransport
 	if cfg.IdlePoll <= 0 {
 		cfg.IdlePoll = 250 * time.Millisecond
 	}
-	
+
 	// NEW: Default to 4 connections (like Dagger)
 	numConns := cfg.NumConnections
 	if numConns <= 0 {
 		numConns = 4
 	}
-	
+
 	// NEW: Expand connections array if needed
 	if len(conns) > 0 && len(conns) < numConns {
 		baseConn := conns[0]
@@ -272,7 +262,7 @@ func NewHTTPMuxTransport(conns []*HTTPConn, cfg HTTPMuxConfig) *HTTPMuxTransport
 			conns = append(conns, newConn)
 		}
 	}
-	
+
 	concurrencyLimit := len(conns) * 4
 	if concurrencyLimit < 4 {
 		concurrencyLimit = 4
@@ -292,17 +282,20 @@ func (t *HTTPMuxTransport) Start() error {
 	if len(t.conns) == 0 {
 		return errors.New("no conns")
 	}
-	
+
 	t.wg.Add(1)
 	go t.loop()
-	
+
 	// NEW: Start decoy traffic if enabled
 	if t.cfg.EnableDecoy {
+		// seed math/rand for decoy randomization
+		mrand.Seed(time.Now().UnixNano())
+
 		ctx, cancel := context.WithCancel(context.Background())
 		t.decoyCancel = cancel
 		t.startDecoyTraffic(ctx)
 	}
-	
+
 	return nil
 }
 
@@ -312,12 +305,12 @@ func (t *HTTPMuxTransport) Close() error {
 	default:
 		close(t.die)
 	}
-	
+
 	// NEW: Stop decoy traffic
 	if t.decoyCancel != nil {
 		t.decoyCancel()
 	}
-	
+
 	t.wg.Wait()
 	return nil
 }
@@ -351,7 +344,7 @@ func (t *HTTPMuxTransport) startDecoyTraffic(ctx context.Context) {
 	if interval <= 0 {
 		interval = 5 * time.Second
 	}
-	
+
 	fakePaths := []string{
 		"/search",
 		"/search?q=recipe+ideas",
@@ -359,17 +352,17 @@ func (t *HTTPMuxTransport) startDecoyTraffic(ctx context.Context) {
 		"/search?q=news",
 		"/api/trending",
 	}
-	
+
 	t.wg.Add(1)
 	go func() {
 		defer t.wg.Done()
-		
+
 		// Random initial delay to avoid synchronization
-		time.Sleep(time.Duration(rand.Intn(3000)) * time.Millisecond)
-		
+		time.Sleep(time.Duration(mrand.Intn(3000)) * time.Millisecond)
+
 		ticker := time.NewTicker(interval)
 		defer ticker.Stop()
-		
+
 		for {
 			select {
 			case <-ctx.Done():
@@ -377,31 +370,27 @@ func (t *HTTPMuxTransport) startDecoyTraffic(ctx context.Context) {
 			case <-t.die:
 				return
 			case <-ticker.C:
-				// Pick random connection and path
 				conn := t.pickConn()
-				fakePath := fakePaths[rand.Intn(len(fakePaths))]
-				
-				// Create fake GET request
+				fakePath := fakePaths[mrand.Intn(len(fakePaths))]
+
 				req, err := http.NewRequest("GET", conn.ServerURL+fakePath, nil)
 				if err != nil {
 					continue
 				}
-				
-				// Apply realistic headers
+
 				if conn.Mimic != nil && conn.Mimic.FakeDomain != "" {
 					req.Host = conn.Mimic.FakeDomain
 				}
-				
+
 				req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
 				req.Header.Set("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8")
 				req.Header.Set("Accept-Language", "en-US,en;q=0.9")
 				req.Header.Set("Accept-Encoding", "gzip, deflate, br")
 				req.Header.Set("Connection", "keep-alive")
-				
-				// Send request (ignore response)
+
 				resp, err := conn.Client.Do(req)
 				if err == nil && resp != nil {
-					resp.Body.Close()
+					_ = resp.Body.Close()
 				}
 			}
 		}
@@ -421,7 +410,7 @@ func (t *HTTPMuxTransport) loop() {
 
 		var conn *HTTPConn
 		now := time.Now()
-		
+
 		for i := 0; i < len(t.conns); i++ {
 			c := t.pickConn()
 			if c.canTry(now) {
