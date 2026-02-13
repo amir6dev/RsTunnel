@@ -18,6 +18,7 @@ type FrameTransport interface {
 }
 
 type HTTPConn struct {
+	CookieName string
 	Client    *http.Client
 	Mimic     *MimicConfig
 	Obfs      *ObfsConfig
@@ -72,7 +73,7 @@ func (hc *HTTPConn) RoundTrip(payload []byte) ([]byte, error) {
 			req.ContentLength = -1
 		}
 	}
-	ApplyMimicHeaders(req, hc.Mimic, hc.SessionID)
+	ApplyMimicHeaders(req, hc.Mimic, hc.CookieName, hc.SessionID)
 
 	resp, err := hc.Client.Do(req)
 	if err != nil {
@@ -82,7 +83,16 @@ func (hc *HTTPConn) RoundTrip(payload []byte) ([]byte, error) {
 
 	if hc.Mimic != nil && hc.Mimic.SessionCookie {
 		for _, c := range resp.Cookies() {
-			if c != nil && c.Name == "session" && c.Value != "" {
+			if c == nil || c.Value == "" {
+				continue
+			}
+			// If we don't yet know the cookie name, adopt the first one we see.
+			if hc.CookieName == "" {
+				hc.CookieName = c.Name
+				hc.SessionID = c.Value
+				break
+			}
+			if c.Name == hc.CookieName {
 				hc.SessionID = c.Value
 				break
 			}

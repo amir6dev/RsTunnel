@@ -37,6 +37,8 @@ DL_PREFIXES=(
   "https://gh-proxy.com/"
 )
 
+USER_AGENT="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
+
 # --------- Colors / UI ----------
 COLOR_RESET="\033[0m"
 COLOR_GREEN="\033[0;32m"
@@ -146,8 +148,10 @@ download_with_prefixes() {
   rm -f "$out" >/dev/null 2>&1 || true
   for p in "${DL_PREFIXES[@]}"; do
     full="${p}${url}"
-    if curl -fL --retry 3 --retry-delay 1 --connect-timeout 10 --max-time 240 \
-      -H "Accept: application/octet-stream" \
+    if curl -fL --retry 3 --retry-connrefused --retry-delay 1 --connect-timeout 10 --max-time 240 \
+      -A "$USER_AGENT" \
+      -H "Accept: */*" \
+      -H "Cache-Control: no-cache" \
       "$full" -o "$out" >/dev/null 2>&1; then
       if [[ -s "$out" ]]; then
         return 0
@@ -231,11 +235,16 @@ install_core_from_release() {
     return 1
   fi
 
-  # Detect HTML/text (blocked/proxy page)
-  if file "$tgz" | grep -qiE "HTML|text"; then
-    warn "Downloaded content looks like HTML/text (blocked/proxy page)."
-    rm -rf "$tmpd" || true
-    err "Core update failed. Try changing mirror prefixes or use a proxy."
+  # Detect obvious HTML/text (blocked/proxy pages)
+  if head -c 256 "$tmp" 2>/dev/null | grep -Eqi "<!doctype html|<html|access denied|forbidden|cloudflare"; then
+    echo "! Downloaded content looks like an HTML block/proxy page."
+    return 1
+  fi
+
+  # Verify gzip magic bytes (1f 8b) for tar.gz assets
+  magic="$(head -c 2 "$tmp" 2>/dev/null | od -An -tx1 | tr -d ' \n')"
+  if [[ "$magic" != "1f8b" ]]; then
+    echo "! Downloaded content is not a gzip archive (unexpected magic: $magic)."
     return 1
   fi
 

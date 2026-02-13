@@ -1,8 +1,11 @@
 package httpmux
 
 import (
+	"math/rand"
 	"net/http"
+	"net/url"
 	"strings"
+	"time"
 )
 
 type MimicConfig struct {
@@ -14,7 +17,7 @@ type MimicConfig struct {
 	Chunked       bool     `yaml:"chunked"`
 }
 
-func ApplyMimicHeaders(req *http.Request, cfg *MimicConfig, sessionID string) {
+func ApplyMimicHeaders(req *http.Request, cfg *MimicConfig, cookieName, cookieValue string) {
 	req.Header.Set("Accept", "*/*")
 	req.Header.Set("Accept-Language", "en-US,en;q=0.9")
 	req.Header.Set("Cache-Control", "no-cache")
@@ -54,7 +57,43 @@ func ApplyMimicHeaders(req *http.Request, cfg *MimicConfig, sessionID string) {
 		}
 	}
 
-	if cfg.SessionCookie && sessionID != "" {
-		req.Header.Set("Cookie", "session="+sessionID)
+	if cfg.SessionCookie {
+		if cookieName == "" {
+			cookieName = "session"
+		}
+		if cookieValue != "" {
+			req.Header.Set("Cookie", cookieName+"="+cookieValue)
+		}
 	}
+}
+
+
+// BuildURLWithFakePath returns a URL string based on baseURL but with its path replaced by fakePath.
+// If fakePath contains "{rand}", it will be replaced with a random 8-char alphanumeric string.
+func BuildURLWithFakePath(baseURL, fakePath string) (string, error) {
+	if fakePath == "" {
+		return baseURL, nil
+	}
+	u, err := url.Parse(baseURL)
+	if err != nil {
+		return "", err
+	}
+	fp := fakePath
+	if strings.Contains(fp, "{rand}") {
+		fp = strings.ReplaceAll(fp, "{rand}", randAlphaNum(8))
+	}
+	if !strings.HasPrefix(fp, "/") {
+		fp = "/" + fp
+	}
+	u.Path = fp
+	return u.String(), nil
+}
+
+func randAlphaNum(n int) string {
+	const letters = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
+	b := make([]byte, n)
+	for i := range b {
+		b[i] = letters[rand.Intn(len(letters))]
+	}
+	return string(b)
 }
