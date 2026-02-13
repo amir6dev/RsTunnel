@@ -15,6 +15,18 @@ type ObfsConfig struct {
 	BurstChance int  `yaml:"burst_chance"`
 }
 
+// Decoy strings to inject into the padding to mimic Dagger's traffic patterns
+var decoyPatterns = []string{
+	"User-Agent: ",
+	"GET / HTTP/1.1",
+	"POST / HTTP/1.1",
+	"Host: ",
+	"Accept: */*",
+	"Content-Type: application/octet-stream",
+	"Connection: keep-alive",
+	"Cache-Control: no-cache",
+}
+
 // Wire: [2 bytes padLen][data][padding]
 func ApplyObfuscation(data []byte, cfg *ObfsConfig) []byte {
 	if cfg == nil || !cfg.Enabled {
@@ -29,12 +41,38 @@ func ApplyObfuscation(data []byte, cfg *ObfsConfig) []byte {
 		pad = 0
 	}
 
+	// Create output buffer
 	out := make([]byte, 2+len(data)+pad)
+	
+	// Write padding length (BigEndian)
 	binary.BigEndian.PutUint16(out[:2], uint16(pad))
+	
+	// Copy actual data
 	copy(out[2:], data)
 
 	if pad > 0 {
-		_, _ = rand.Read(out[2+len(data):])
+		// 1. Fill padding area with random bytes first
+		paddingArea := out[2+len(data):]
+		_, _ = rand.Read(paddingArea)
+
+		// 2. Dagger-Mimic: Inject a decoy string if padding is large enough
+		// We only do this if we have enough space (e.g., > 12 bytes)
+		if pad > 12 {
+			// Pick a random decoy string
+			decoyIdx := int(randByte()) % len(decoyPatterns)
+			decoyStr := decoyPatterns[decoyIdx]
+
+			// Only inject if it fits
+			if len(decoyStr) < pad {
+				// Pick a random offset within the padding to place the decoy
+				// We ensure it fits entirely within the padding slice
+				maxOffset := pad - len(decoyStr)
+				offset := int(randByte()) % (maxOffset + 1)
+				
+				// Overwrite random bytes with the decoy string
+				copy(paddingArea[offset:], []byte(decoyStr))
+			}
+		}
 	}
 	return out
 }
@@ -46,11 +84,15 @@ func StripObfuscation(data []byte, cfg *ObfsConfig) []byte {
 	if len(data) < 2 {
 		return nil
 	}
+	// Read padding length
 	pad := int(binary.BigEndian.Uint16(data[:2]))
 	body := data[2:]
+	
+	// Validate padding length
 	if pad < 0 || pad > len(body) {
 		return nil
 	}
+	// Slice off the padding (this automatically discards the decoy strings)
 	return body[:len(body)-pad]
 }
 
