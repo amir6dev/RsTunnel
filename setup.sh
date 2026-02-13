@@ -127,8 +127,6 @@ ensure_deps() {
   fi
 
   warn "Installing missing: ${missing[*]}"
-  # Note: "systemd" package name differs; we won't try install it automatically.
-  # We'll only install standard tools; systemd is assumed on most servers.
   local installable=()
   for p in "${missing[@]}"; do
     [[ "$p" == "systemd" ]] || installable+=("$p")
@@ -141,24 +139,61 @@ ensure_deps() {
 }
 
 # --------- Download helpers ----------
+is_probably_html() {
+  # check first 512 bytes for common HTML/proxy/challenge pages
+  local f="$1"
+  local head512
+  head512="$(head -c 512 "$f" 2>/dev/null || true)"
+  echo "$head512" | grep -Eqi \
+    "<!doctype html|<html|access denied|forbidden|cloudflare|just a moment|nginx|proxy|blocked|captcha"
+}
+
+is_gzip_file() {
+  local f="$1"
+  local magic
+  magic="$(head -c 2 "$f" 2>/dev/null | od -An -tx1 | tr -d ' \n' || true)"
+  [[ "$magic" == "1f8b" ]] || return 1
+  file "$f" | grep -qiE "gzip compressed data"
+}
+
 download_with_prefixes() {
+  # Only succeeds if we downloaded a REAL gzip file (not HTML).
   local url="$1" out="$2"
   local p full
 
   rm -f "$out" >/dev/null 2>&1 || true
+
   for p in "${DL_PREFIXES[@]}"; do
     full="${p}${url}"
-    if curl -fL --retry 3 --retry-connrefused --retry-delay 1 --connect-timeout 10 --max-time 240 \
-      -A "$USER_AGENT" \
-      -H "Accept: */*" \
-      -H "Cache-Control: no-cache" \
-      "$full" -o "$out" >/dev/null 2>&1; then
-      if [[ -s "$out" ]]; then
-        return 0
-      fi
-    fi
     rm -f "$out" >/dev/null 2>&1 || true
+
+    # Download
+    if ! curl -fL --retry 3 --retry-connrefused --retry-delay 1 \
+      --connect-timeout 10 --max-time 240 \
+      -A "$USER_AGENT" \
+      -H "Accept: application/octet-stream,*/*;q=0.8" \
+      -H "Cache-Control: no-cache" \
+      --compressed \
+      "$full" -o "$out" >/dev/null 2>&1; then
+      continue
+    fi
+
+    [[ -s "$out" ]] || continue
+
+    # Reject HTML/proxy pages
+    if is_probably_html "$out"; then
+      continue
+    fi
+
+    # Must be gzip
+    if ! is_gzip_file "$out"; then
+      continue
+    fi
+
+    ok "Download OK via mirror: ${p:-direct}"
+    return 0
   done
+
   return 1
 }
 
@@ -169,7 +204,7 @@ get_latest_tag_via_redirect() {
 
   for p in "${DL_PREFIXES[@]}"; do
     u="${p}${url}"
-    loc="$(curl -fsSLI --connect-timeout 10 --max-time 30 "$u" 2>/dev/null \
+    loc="$(curl -fsSLI --connect-timeout 10 --max-time 30 -A "$USER_AGENT" "$u" 2>/dev/null \
       | awk -F': ' 'tolower($1)=="location"{print $2}' | tail -n 1 | tr -d '\r')"
     if [[ -n "$loc" ]]; then
       echo "$loc" | awk -F'/tag/' '{print $2}' | tr -d '\r'
@@ -225,45 +260,28 @@ install_core_from_release() {
     return 0
   fi
 
-  tmpd="$(mktemp -d /tmp/${BIN_NAME}-dl.XXXXXX)"
-  tgz="${tmpd}/${BIN_NAME}.tgz"
+  tmpd="$(mktemp -d "/tmp/${BIN_NAME}-dl.XXXXXX")"
+  tgz="${tmpd}/${BIN_NAME}.tar.gz"
 
   if ! download_with_prefixes "$url" "$tgz"; then
-    rm -rf "$tmpd" || true
-    err "Download failed (blocked or mirror issue)."
+    warn "Downloaded content looks like an HTML block/proxy page OR not a valid gzip."
+    err "Core update failed. Try another mirror prefix or use a proxy/VPN."
     err "URL: $url"
-    return 1
-  fi
-
-    # Detect obvious HTML/text (blocked/proxy pages)
-  if head -c 256 "$tgz" 2>/dev/null | grep -Eqi "<!doctype html|<html|access denied|forbidden|cloudflare"; then
-    warn "Downloaded content looks like an HTML block/proxy page."
     rm -rf "$tmpd" || true
     return 1
   fi
 
-  # Verify gzip magic bytes (1f 8b) for tar.gz assets
-  local magic
-  magic="$(head -c 2 "$tgz" 2>/dev/null | od -An -tx1 | tr -d ' \n')"
-  if [[ "$magic" != "1f8b" ]]; then
-    warn "Downloaded content is not a gzip archive (unexpected magic: ${magic})."
+  # Extract & validate
+  if ! tar -xzf "$tgz" -C "$tmpd" >/dev/null 2>&1; then
+    err "Failed to extract downloaded archive."
     rm -rf "$tmpd" || true
     return 1
   fi
 
-
-  if ! file "$tgz" | grep -qiE "gzip compressed data"; then
-    warn "Downloaded file is not a gzip archive."
-    rm -rf "$tmpd" || true
-    err "Core update failed."
-    return 1
-  fi
-
-  tar -xzf "$tgz" -C "$tmpd"
   if [[ ! -f "${tmpd}/${BIN_NAME}" ]]; then
-    rm -rf "$tmpd" || true
     err "Archive doesn't contain ${BIN_NAME}"
     err "Make sure release asset contains a file named '${BIN_NAME}'"
+    rm -rf "$tmpd" || true
     return 1
   fi
 
@@ -367,18 +385,16 @@ health_check_server() {
     netstat -lntp 2>/dev/null | grep -E "[:.]${port}\\b" >/dev/null 2>&1 && ok "Listening on port ${port}" || warn "Not listening on port ${port}"
   fi
 
-  # Try to detect fake_path from yaml (best-effort, no full YAML parser)
   local fake_path="/tunnel"
   if [[ -f "$cfg" ]]; then
     local fp
-    fp="$(grep -E '^\\\s*fake_path:' "$cfg" 2>/dev/null | head -n1 | awk -F: '{print $2}' | tr -d ' "\\r' || true)"
+    fp="$(grep -E '^[[:space:]]*fake_path:' "$cfg" 2>/dev/null | head -n1 | awk -F: '{print $2}' | tr -d ' "\r' || true)"
     if [[ -n "$fp" ]]; then
       [[ "$fp" == /* ]] || fp="/$fp"
       fake_path="$fp"
     fi
   fi
 
-  # Probe (POST) both fake_path and /tunnel
   curl -fsS -X POST "http://127.0.0.1:${port}${fake_path}" -o /dev/null 2>&1 \
     && ok "HTTP tunnel endpoint responds (${fake_path})" \
     || warn "Tunnel endpoint probe failed (${fake_path}) (may still be OK if it expects framed traffic)"
@@ -621,18 +637,12 @@ install_client_flow() {
     retry="$(ask "Retry interval (seconds)" "3")"
     dial_timeout="$(ask "Dial timeout (seconds)" "10")"
 
-    paths_yaml+=$'  - transport: "'${transport}$'"
-'
-    paths_yaml+=$'    addr: "'${addr}$'"
-'
-    paths_yaml+=$'    connection_pool: '${pool}$'
-'
-    paths_yaml+=$'    aggressive_pool: '${aggressive}$'
-'
-    paths_yaml+=$'    retry_interval: '${retry}$'
-'
-    paths_yaml+=$'    dial_timeout: '${dial_timeout}$'
-'
+    paths_yaml+=$'  - transport: "'${transport}$'"\n'
+    paths_yaml+=$'    addr: "'${addr}$'"\n'
+    paths_yaml+=$'    connection_pool: '${pool}$'\n'
+    paths_yaml+=$'    aggressive_pool: '${aggressive}$'\n'
+    paths_yaml+=$'    retry_interval: '${retry}$'\n'
+    paths_yaml+=$'    dial_timeout: '${dial_timeout}$'\n'
 
     echo
     if ! ask_yn "Add another path?" "N"; then
@@ -641,7 +651,7 @@ install_client_flow() {
     echo
   done
 
-echo "═══════════════════════════════════════"
+  echo "═══════════════════════════════════════"
   echo "      HTTP MIMICRY SETTINGS"
   echo "═══════════════════════════════════════"
   echo
