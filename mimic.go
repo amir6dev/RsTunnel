@@ -8,6 +8,11 @@ import (
 	"time"
 )
 
+func init() {
+	// rand is used only for fake path generation; seed it once.
+	rand.Seed(time.Now().UnixNano())
+}
+
 type MimicConfig struct {
 	FakeDomain    string   `yaml:"fake_domain"`
 	FakePath      string   `yaml:"fake_path"`
@@ -26,8 +31,11 @@ func ApplyMimicHeaders(req *http.Request, cfg *MimicConfig, cookieName, cookieVa
 
 	if cfg == nil {
 		req.Header.Set("User-Agent", "Mozilla/5.0")
-		if sessionID != "" {
-			req.Header.Set("Cookie", "session="+sessionID)
+		if cookieValue != "" {
+			if cookieName == "" {
+				cookieName = "session"
+			}
+			req.Header.Set("Cookie", cookieName+"="+cookieValue)
 		}
 		return
 	}

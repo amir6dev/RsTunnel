@@ -17,6 +17,16 @@ jobs:
         with:
           fetch-depth: 0
 
+      - name: Sanity check (no merge conflict markers)
+        run: |
+          set -euo pipefail
+          # Fail fast if any unresolved git conflict markers made it into the tree.
+          if grep -RIn --exclude-dir=.git --exclude-dir=dist --exclude-dir=dist2 \
+            -e '^<<<<<<< ' -e '^=======$' -e '^>>>>>>> ' .; then
+            echo "\nERROR: Unresolved merge conflict markers found.\n"
+            exit 1
+          fi
+
       - name: Setup Go
         uses: actions/setup-go@v5
         with:
