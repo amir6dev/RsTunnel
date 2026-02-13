@@ -1,21 +1,73 @@
 package httpmux
 
+// PATCH FILE: Enhanced transport.go with Dagger-like multi-connection + decoy traffic
+// این کد باید جایگزین transport.go موجود شود یا به آن merge شود
+
 import (
 	"bytes"
+	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"errors"
 	"io"
+	"math/rand"
 	"net/http"
 	"sync"
 	"sync/atomic"
 	"time"
 )
 
-type FrameTransport interface {
-	Start() error
-	Close() error
-	Send(fr *Frame) error
-	Recv() (*Frame, error)
+// ========== NEW: Helper Functions ==========
+
+// generateRandomSessionID creates a random session ID (like Dagger does)
+func generateRandomSessionID() string {
+	b := make([]byte, 16)
+	rand.Read(b)
+	return hex.EncodeToString(b)
 }
+
+// GenerateFakeHTTPHeaders creates HTTP-like headers to embed in encrypted payload
+func GenerateFakeHTTPHeaders(cfg *MimicConfig, sessionID string) []byte {
+	if cfg == nil {
+		return nil
+	}
+	
+	headers := "POST /api/data HTTP/1.1\r\n"
+	
+	if cfg.FakeDomain != "" {
+		headers += "Host: " + cfg.FakeDomain + "\r\n"
+	}
+	
+	ua := cfg.UserAgent
+	if ua == "" {
+		ua = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+	}
+	headers += "User-Agent: " + ua + "\r\n"
+	
+	headers += "Content-Type: application/octet-stream\r\n"
+	headers += "Accept-Encoding: gzip, deflate, br\r\n"
+	headers += "Accept-Language: en-US,en;q=0.9\r\n"
+	headers += "Connection: keep-alive\r\n"
+	
+	if sessionID != "" {
+		headers += "Cookie: session=" + sessionID + "\r\n"
+	}
+	
+	headers += "\r\n"
+	return []byte(headers)
+}
+
+// stripFakeHeaders removes embedded HTTP headers from decrypted payload
+func stripFakeHeaders(data []byte) []byte {
+	marker := []byte("\r\n\r\n")
+	idx := bytes.Index(data, marker)
+	if idx == -1 {
+		return data // No headers found
+	}
+	return data[idx+4:]
+}
+
+// ========== MODIFIED: HTTPConn with embedded headers ==========
 
 type HTTPConn struct {
 	Client    *http.Client
@@ -25,10 +77,12 @@ type HTTPConn struct {
 	SessionID string
 	ServerURL string
 
-	// Path-level behaviors
 	RetryInterval time.Duration
 	Aggressive    bool
 	nextTryNS     int64
+	
+	// NEW: Enable fake header embedding
+	EmbedFakeHeaders bool
 }
 
 func (hc *HTTPConn) canTry(now time.Time) bool {
@@ -56,6 +110,15 @@ func (hc *HTTPConn) markOK() {
 func (hc *HTTPConn) RoundTrip(payload []byte) ([]byte, error) {
 	if hc.Client == nil {
 		hc.Client = &http.Client{Timeout: 25 * time.Second}
+	}
+
+	// NEW: Prepend fake HTTP headers to payload BEFORE encryption (Dagger-like)
+	if hc.EmbedFakeHeaders && len(payload) > 0 {
+		fakeHeaders := GenerateFakeHTTPHeaders(hc.Mimic, hc.SessionID)
+		if len(fakeHeaders) > 0 {
+			payloadWithHeaders := append(fakeHeaders, payload...)
+			payload = payloadWithHeaders
+		}
 	}
 
 	// Encrypt -> Obfs
@@ -111,14 +174,30 @@ func (hc *HTTPConn) RoundTrip(payload []byte) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
+	
+	// NEW: Strip embedded fake headers if they exist
+	if hc.EmbedFakeHeaders {
+		plain = stripFakeHeaders(plain)
+	}
+	
 	return plain, nil
 }
+
+// ========== MODIFIED: HTTPMuxConfig with new options ==========
 
 type HTTPMuxConfig struct {
 	FlushInterval time.Duration
 	MaxBatch      int
 	IdlePoll      time.Duration
+	
+	// NEW: Dagger-like features
+	NumConnections   int           `yaml:"num_connections"`    // Number of parallel connections
+	EnableDecoy      bool          `yaml:"enable_decoy"`       // Enable fake GET requests
+	DecoyInterval    time.Duration `yaml:"decoy_interval"`     // Interval for decoy traffic
+	EmbedFakeHeaders bool          `yaml:"embed_fake_headers"` // Embed HTTP headers in encrypted payload
 }
+
+// ========== MODIFIED: HTTPMuxTransport with decoy support ==========
 
 type HTTPMuxTransport struct {
 	conns []*HTTPConn
@@ -132,24 +211,49 @@ type HTTPMuxTransport struct {
 
 	rr uint32
 	
-	// Semaphore to limit concurrent inflight requests (Backpressure)
 	sem chan struct{}
+	
+	// NEW: Decoy traffic control
+	decoyCancel context.CancelFunc
 }
 
 func NewHTTPMuxTransport(conns []*HTTPConn, cfg HTTPMuxConfig) *HTTPMuxTransport {
 	if cfg.FlushInterval <= 0 {
-		cfg.FlushInterval = 20 * time.Millisecond // Faster flush for responsiveness
+		cfg.FlushInterval = 20 * time.Millisecond
 	}
 	if cfg.MaxBatch <= 0 {
-		cfg.MaxBatch = 128 // Increased batch size
+		cfg.MaxBatch = 128
 	}
 	if cfg.IdlePoll <= 0 {
 		cfg.IdlePoll = 250 * time.Millisecond
 	}
 	
-	// Limit concurrency to roughly 2x the number of connections per path
-	// This ensures we use all connections but don't explode memory if net is slow.
-	concurrencyLimit := len(conns) * 4 
+	// NEW: Default to 4 connections (like Dagger)
+	numConns := cfg.NumConnections
+	if numConns <= 0 {
+		numConns = 4
+	}
+	
+	// NEW: Expand connections array if needed
+	if len(conns) > 0 && len(conns) < numConns {
+		baseConn := conns[0]
+		for i := len(conns); i < numConns; i++ {
+			newConn := &HTTPConn{
+				Client:           &http.Client{Timeout: 25 * time.Second},
+				Mimic:            baseConn.Mimic,
+				Obfs:             baseConn.Obfs,
+				PSK:              baseConn.PSK,
+				SessionID:        generateRandomSessionID(),
+				ServerURL:        baseConn.ServerURL,
+				RetryInterval:    baseConn.RetryInterval,
+				Aggressive:       baseConn.Aggressive,
+				EmbedFakeHeaders: cfg.EmbedFakeHeaders,
+			}
+			conns = append(conns, newConn)
+		}
+	}
+	
+	concurrencyLimit := len(conns) * 4
 	if concurrencyLimit < 4 {
 		concurrencyLimit = 4
 	}
@@ -157,7 +261,7 @@ func NewHTTPMuxTransport(conns []*HTTPConn, cfg HTTPMuxConfig) *HTTPMuxTransport
 	return &HTTPMuxTransport{
 		conns: conns,
 		cfg:   cfg,
-		out:   make(chan *Frame, 8192), // Larger buffer
+		out:   make(chan *Frame, 8192),
 		in:    make(chan *Frame, 8192),
 		die:   make(chan struct{}),
 		sem:   make(chan struct{}, concurrencyLimit),
@@ -168,8 +272,17 @@ func (t *HTTPMuxTransport) Start() error {
 	if len(t.conns) == 0 {
 		return errors.New("no conns")
 	}
+	
 	t.wg.Add(1)
 	go t.loop()
+	
+	// NEW: Start decoy traffic if enabled
+	if t.cfg.EnableDecoy {
+		ctx, cancel := context.WithCancel(context.Background())
+		t.decoyCancel = cancel
+		t.startDecoyTraffic(ctx)
+	}
+	
 	return nil
 }
 
@@ -179,6 +292,12 @@ func (t *HTTPMuxTransport) Close() error {
 	default:
 		close(t.die)
 	}
+	
+	// NEW: Stop decoy traffic
+	if t.decoyCancel != nil {
+		t.decoyCancel()
+	}
+	
 	t.wg.Wait()
 	return nil
 }
@@ -206,6 +325,69 @@ func (t *HTTPMuxTransport) pickConn() *HTTPConn {
 	return t.conns[int(i)%len(t.conns)]
 }
 
+// NEW: Decoy traffic generator (mimics Dagger's fake GET requests)
+func (t *HTTPMuxTransport) startDecoyTraffic(ctx context.Context) {
+	interval := t.cfg.DecoyInterval
+	if interval <= 0 {
+		interval = 5 * time.Second
+	}
+	
+	fakePaths := []string{
+		"/search",
+		"/search?q=recipe+ideas",
+		"/search?q=best+restaurants+near+me",
+		"/search?q=news",
+		"/api/trending",
+	}
+	
+	t.wg.Add(1)
+	go func() {
+		defer t.wg.Done()
+		
+		// Random initial delay to avoid synchronization
+		time.Sleep(time.Duration(rand.Intn(3000)) * time.Millisecond)
+		
+		ticker := time.NewTicker(interval)
+		defer ticker.Stop()
+		
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-t.die:
+				return
+			case <-ticker.C:
+				// Pick random connection and path
+				conn := t.pickConn()
+				fakePath := fakePaths[rand.Intn(len(fakePaths))]
+				
+				// Create fake GET request
+				req, err := http.NewRequest("GET", conn.ServerURL+fakePath, nil)
+				if err != nil {
+					continue
+				}
+				
+				// Apply realistic headers
+				if conn.Mimic != nil && conn.Mimic.FakeDomain != "" {
+					req.Host = conn.Mimic.FakeDomain
+				}
+				
+				req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
+				req.Header.Set("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8")
+				req.Header.Set("Accept-Language", "en-US,en;q=0.9")
+				req.Header.Set("Accept-Encoding", "gzip, deflate, br")
+				req.Header.Set("Connection", "keep-alive")
+				
+				// Send request (ignore response)
+				resp, err := conn.Client.Do(req)
+				if err == nil && resp != nil {
+					resp.Body.Close()
+				}
+			}
+		}
+	}()
+}
+
 func (t *HTTPMuxTransport) loop() {
 	defer t.wg.Done()
 
@@ -214,15 +396,12 @@ func (t *HTTPMuxTransport) loop() {
 
 	var batch []*Frame
 
-	// Helper to execute a round-trip asynchronously
 	doRequest := func(payload []byte) {
-		defer func() { <-t.sem }() // Release semaphore token
+		defer func() { <-t.sem }()
 
-		// Try to find a healthy connection
 		var conn *HTTPConn
 		now := time.Now()
 		
-		// Simple retry logic for picking a connection
 		for i := 0; i < len(t.conns); i++ {
 			c := t.pickConn()
 			if c.canTry(now) {
@@ -230,7 +409,6 @@ func (t *HTTPMuxTransport) loop() {
 				break
 			}
 		}
-		// If all are cooling down, just pick one anyway to avoid stalling
 		if conn == nil {
 			conn = t.pickConn()
 		}
@@ -246,7 +424,6 @@ func (t *HTTPMuxTransport) loop() {
 			return
 		}
 
-		// Process response frames
 		r := bytes.NewReader(resp)
 		for {
 			fr, err := ReadFrame(r)
@@ -263,31 +440,24 @@ func (t *HTTPMuxTransport) loop() {
 
 	flush := func() {
 		if len(batch) == 0 {
-			// Idle poll (heartbeat/poll) logic
-			// Only poll if we have capacity in semaphore
 			select {
 			case t.sem <- struct{}{}:
 				go doRequest(nil)
 			default:
-				// If busy, skip idle polling
 			}
 			return
 		}
 
-		// Serialize batch
 		var buf bytes.Buffer
 		for _, fr := range batch {
 			_ = WriteFrame(&buf, fr)
 		}
-		// Clear batch slice but keep capacity
 		batch = batch[:0]
 
-		// Acquire semaphore token (Backpressure: wait if too many requests inflight)
 		select {
 		case t.sem <- struct{}{}:
-			// Launch request in background
 			payload := make([]byte, buf.Len())
-			copy(payload, buf.Bytes()) // Copy buffer because buf is reused
+			copy(payload, buf.Bytes())
 			go doRequest(payload)
 		case <-t.die:
 			return
