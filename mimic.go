@@ -39,11 +39,16 @@ func ApplyMimicHeaders(req *http.Request, cfg *MimicConfig, sessionID string) {
 	}
 
 <<<<<<< HEAD
+<<<<<<< HEAD
 	// Dagger-style mimic: Host spoof + path request are handled elsewhere.
 	// Here we only ensure headers look browser-like.
 =======
 
 >>>>>>> 761e0881dbe95042a42689a9d133dc400c8d6457
+=======
+	// Dagger-style mimic: Host spoof + path request are handled elsewhere.
+	// Here we only ensure headers look browser-like.
+>>>>>>> 6b30d3e (New Update)
 	// If no custom headers provided, apply a Dagger-like minimal set.
 	if len(cfg.CustomHeaders) == 0 {
 		req.Header.Set("X-Requested-With", "XMLHttpRequest")

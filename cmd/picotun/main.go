@@ -13,12 +13,14 @@ import (
 var version = "dev"
 
 func main() {
+	// Dagger-like UX: support both -version and -v
 	showVersion := flag.Bool("version", false, "print version and exit")
+	showVersionShort := flag.Bool("v", false, "print version and exit")
 	configPath := flag.String("config", "/etc/picotun/config.yaml", "path to config file")
 	configShort := flag.String("c", "", "alias for -config")
 	flag.Parse()
 
-	if *showVersion {
+	if *showVersion || *showVersionShort {
 		log.Printf("%s", version)
 		return
 	}
@@ -84,16 +86,20 @@ func main() {
 		}
 
 <<<<<<< HEAD
+<<<<<<< HEAD
 =======
 <<<<<<< HEAD
 =======
 <<<<<<< HEAD
 >>>>>>> 62fc88353bdf49aa22a0ab96b51f1b4749e1d595
 >>>>>>> 761e0881dbe95042a42689a9d133dc400c8d6457
+=======
+>>>>>>> 6b30d3e (New Update)
 		// Prefer Dagger-style paths (multi-path)
 		var paths []httpmux.PathConfig
 		if len(cfg.Paths) > 0 {
 			paths = cfg.Paths
+<<<<<<< HEAD
 <<<<<<< HEAD
 =======
 <<<<<<< HEAD
@@ -106,10 +112,13 @@ func main() {
 >>>>>>> de61458072bfcfd0a2ba33f1a1c20aaacc44f94c
 >>>>>>> 62fc88353bdf49aa22a0ab96b51f1b4749e1d595
 >>>>>>> 761e0881dbe95042a42689a9d133dc400c8d6457
+=======
+>>>>>>> 6b30d3e (New Update)
 		} else {
 			if strings.TrimSpace(cfg.ServerURL) == "" {
 				log.Fatal("client requires either 'paths:' or 'server_url:'")
 			}
+<<<<<<< HEAD
 <<<<<<< HEAD
 			paths = append(paths, httpmux.PathConfig{
 =======
@@ -123,6 +132,9 @@ func main() {
 >>>>>>> de61458072bfcfd0a2ba33f1a1c20aaacc44f94c
 >>>>>>> 62fc88353bdf49aa22a0ab96b51f1b4749e1d595
 >>>>>>> 761e0881dbe95042a42689a9d133dc400c8d6457
+=======
+			paths = append(paths, httpmux.PathConfig{
+>>>>>>> 6b30d3e (New Update)
 				Transport:      "httpmux",
 				Addr:           cfg.ServerURL,
 				ConnectionPool: 2,
@@ -130,12 +142,15 @@ func main() {
 				RetryInterval:  3,
 				DialTimeout:    10,
 <<<<<<< HEAD
+<<<<<<< HEAD
 =======
 <<<<<<< HEAD
 =======
 <<<<<<< HEAD
 >>>>>>> 62fc88353bdf49aa22a0ab96b51f1b4749e1d595
 >>>>>>> 761e0881dbe95042a42689a9d133dc400c8d6457
+=======
+>>>>>>> 6b30d3e (New Update)
 			})
 		}
 
@@ -148,6 +163,7 @@ func main() {
 		} else {
 			log.Printf("client started. (no paths?) session_id=%s", cfg.SessionID)
 		}
+<<<<<<< HEAD
 <<<<<<< HEAD
 =======
 <<<<<<< HEAD
@@ -164,6 +180,8 @@ func main() {
 >>>>>>> de61458072bfcfd0a2ba33f1a1c20aaacc44f94c
 >>>>>>> 62fc88353bdf49aa22a0ab96b51f1b4749e1d595
 >>>>>>> 761e0881dbe95042a42689a9d133dc400c8d6457
+=======
+>>>>>>> 6b30d3e (New Update)
 		for {
 			time.Sleep(60 * time.Second)
 		}

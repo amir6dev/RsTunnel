@@ -51,6 +51,7 @@ func (s *Server) HandleHTTP(w http.ResponseWriter, r *http.Request) {
 	// 1) Session Handling (Dagger uses cookie name "session")
 	sessionID := extractSessionID(r)
 <<<<<<< HEAD
+<<<<<<< HEAD
 	if s.Mimic != nil && s.Mimic.SessionCookie {
 		if _, err := r.Cookie("session"); err != nil {
 			http.SetCookie(w, &http.Cookie{Name: "session", Value: sessionID, Path: "/", HttpOnly: true, SameSite: http.SameSiteLaxMode})
@@ -60,6 +61,11 @@ func (s *Server) HandleHTTP(w http.ResponseWriter, r *http.Request) {
 		if _, err := r.Cookie("SESSION"); err != nil {
 			http.SetCookie(w, &http.Cookie{Name: "SESSION", Value: sessionID, Path: "/"})
 >>>>>>> 761e0881dbe95042a42689a9d133dc400c8d6457
+=======
+	if s.Mimic != nil && s.Mimic.SessionCookie {
+		if _, err := r.Cookie("session"); err != nil {
+			http.SetCookie(w, &http.Cookie{Name: "session", Value: sessionID, Path: "/", HttpOnly: true, SameSite: http.SameSiteLaxMode})
+>>>>>>> 6b30d3e (New Update)
 		}
 	}
 	sess := s.SessionMgr.GetOrCreate(sessionID)
