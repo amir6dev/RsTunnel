@@ -300,7 +300,7 @@ After=network.target
 Type=simple
 User=root
 WorkingDirectory=${INSTALL_DIR}
-ExecStart=${BIN_PATH} -c ${cfg}
+ExecStart=${BIN_PATH} -config ${cfg}
 Restart=always
 RestartSec=3
 StandardOutput=journal
@@ -323,7 +323,7 @@ After=network.target
 Type=simple
 User=root
 WorkingDirectory=${INSTALL_DIR}
-ExecStart=${BIN_PATH} -c ${cfg}
+ExecStart=${BIN_PATH} -config ${cfg}
 Restart=always
 RestartSec=3
 StandardOutput=journal
@@ -338,21 +338,43 @@ EOF
 # --------- health checks ----------
 health_check_server() {
   local port="$1"
+  local cfg="${INSTALL_DIR}/server.yaml"
+
   echo
   log "🔎 Checking server service & tunnel port..."
   if systemctl is-active --quiet "${SERVICE_SERVER}.service"; then
     ok "Service is active"
   else
-    warn "Service not active"
+    warn "Service not active (check: journalctl -u ${SERVICE_SERVER} -f)"
   fi
 
   if have_cmd ss; then
-    ss -lntp | grep -E "[: ]${port}\b" >/dev/null 2>&1 && ok "Listening on port ${port}" || warn "Not listening on port ${port}"
+    ss -lntp | grep -E "[: ]${port}\\b" >/dev/null 2>&1 && ok "Listening on port ${port}" || warn "Not listening on port ${port}"
   elif have_cmd netstat; then
-    netstat -lntp 2>/dev/null | grep -E "[:.]${port}\b" >/dev/null 2>&1 && ok "Listening on port ${port}" || warn "Not listening on port ${port}"
+    netstat -lntp 2>/dev/null | grep -E "[:.]${port}\\b" >/dev/null 2>&1 && ok "Listening on port ${port}" || warn "Not listening on port ${port}"
   fi
 
-  curl -fsS "http://127.0.0.1:${port}/tunnel" >/dev/null 2>&1 && ok "HTTP endpoint responds" || warn "HTTP endpoint probe failed (may still be OK if it expects framed traffic)"
+  # Try to detect fake_path from yaml (best-effort, no full YAML parser)
+  local fake_path="/tunnel"
+  if [[ -f "$cfg" ]]; then
+    local fp
+    fp="$(grep -E '^\\\s*fake_path:' "$cfg" 2>/dev/null | head -n1 | awk -F: '{print $2}' | tr -d ' "\\r' || true)"
+    if [[ -n "$fp" ]]; then
+      [[ "$fp" == /* ]] || fp="/$fp"
+      fake_path="$fp"
+    fi
+  fi
+
+  # Probe (POST) both fake_path and /tunnel
+  curl -fsS -X POST "http://127.0.0.1:${port}${fake_path}" -o /dev/null 2>&1 \
+    && ok "HTTP tunnel endpoint responds (${fake_path})" \
+    || warn "Tunnel endpoint probe failed (${fake_path}) (may still be OK if it expects framed traffic)"
+
+  if [[ "$fake_path" != "/tunnel" ]]; then
+    curl -fsS -X POST "http://127.0.0.1:${port}/tunnel" -o /dev/null 2>&1 \
+      && ok "Fallback endpoint responds (/tunnel)" \
+      || warn "Fallback endpoint probe failed (/tunnel)"
+  fi
 }
 
 health_check_client() {
@@ -554,33 +576,59 @@ install_client_flow() {
   echo "═══════════════════════════════════════"
   echo
 
-  echo "Select Transport Type:"
-  echo "  1) tcpmux   - TCP Multiplexing"
-  echo "  2) kcpmux   - KCP Multiplexing (UDP)"
-  echo "  3) wsmux    - WebSocket"
-  echo "  4) wssmux   - WebSocket Secure"
-  echo "  5) httpmux  - HTTP Mimicry"
-  echo "  6) httpsmux - HTTPS Mimicry ⭐"
-  local tc transport
-  tc="$(ask "Choice [1-6]" "5")"
-  case "$tc" in
-    1) transport="tcpmux" ;;
-    2) transport="kcpmux" ;;
-    3) transport="wsmux" ;;
-    4) transport="wssmux" ;;
-    6) transport="httpsmux" ;;
-    *) transport="httpmux" ;;
-  esac
+  local paths_yaml=""
+  local path_idx=0
 
-  local addr pool aggressive retry dial_timeout
-  addr="$(ask "Server address with Tunnel Port (e.g., 1.2.3.4:4000)" "")"
-  pool="$(ask "Connection pool size" "2")"
-  if ask_yn "Enable aggressive pool?" "N"; then aggressive="true"; else aggressive="false"; fi
-  retry="$(ask "Retry interval (seconds)" "3")"
-  dial_timeout="$(ask "Dial timeout (seconds)" "10")"
+  while true; do
+    path_idx=$((path_idx+1))
+    echo "Add Connection Path #${path_idx}"
 
-  echo
-  echo "═══════════════════════════════════════"
+    echo "Select Transport Type:"
+    echo "  1) tcpmux   - TCP Multiplexing"
+    echo "  2) kcpmux   - KCP Multiplexing (UDP)"
+    echo "  3) wsmux    - WebSocket"
+    echo "  4) wssmux   - WebSocket Secure"
+    echo "  5) httpmux  - HTTP Mimicry"
+    echo "  6) httpsmux - HTTPS Mimicry ⭐"
+    local tc transport
+    tc="$(ask "Choice [1-6]" "5")"
+    case "$tc" in
+      1) transport="tcpmux" ;;
+      2) transport="kcpmux" ;;
+      3) transport="wsmux" ;;
+      4) transport="wssmux" ;;
+      6) transport="httpsmux" ;;
+      *) transport="httpmux" ;;
+    esac
+
+    local addr pool aggressive retry dial_timeout
+    addr="$(ask "Server address with Tunnel Port (e.g., 1.2.3.4:4000)" "")"
+    pool="$(ask "Connection pool size" "2")"
+    if ask_yn "Enable aggressive pool?" "N"; then aggressive="true"; else aggressive="false"; fi
+    retry="$(ask "Retry interval (seconds)" "3")"
+    dial_timeout="$(ask "Dial timeout (seconds)" "10")"
+
+    paths_yaml+=$'  - transport: "'${transport}$'"
+'
+    paths_yaml+=$'    addr: "'${addr}$'"
+'
+    paths_yaml+=$'    connection_pool: '${pool}$'
+'
+    paths_yaml+=$'    aggressive_pool: '${aggressive}$'
+'
+    paths_yaml+=$'    retry_interval: '${retry}$'
+'
+    paths_yaml+=$'    dial_timeout: '${dial_timeout}$'
+'
+
+    echo
+    if ! ask_yn "Add another path?" "N"; then
+      break
+    fi
+    echo
+  done
+
+echo "═══════════════════════════════════════"
   echo "      HTTP MIMICRY SETTINGS"
   echo "═══════════════════════════════════════"
   echo
@@ -625,12 +673,7 @@ install_client_flow() {
     echo "verbose: ${verbose}"
     echo
     echo "paths:"
-    echo "  - transport: \"${transport}\""
-    echo "    addr: \"${addr}\""
-    echo "    connection_pool: ${pool}"
-    echo "    aggressive_pool: ${aggressive}"
-    echo "    retry_interval: ${retry}"
-    echo "    dial_timeout: ${dial_timeout}"
+    echo -e "${paths_yaml%\n}"
     echo
     echo "obfuscation:"
     echo "  enabled: ${obfs_enabled}"

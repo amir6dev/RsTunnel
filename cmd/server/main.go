@@ -53,10 +53,32 @@ func main() {
 		go srv.StartReverseUDP(bind, target)
 	}
 
-	mux := http.NewServeMux()
-	mux.HandleFunc("/tunnel", srv.HandleHTTP)
+	// Dagger-style: the tunnel endpoint MUST match http_mimic.fake_path
+	// (installer defaults to /search). We'll also keep /tunnel for compatibility.
+	path := strings.TrimSpace(cfg.Mimic.FakePath)
+	if path == "" || path == "/" {
+		path = "/tunnel"
+	}
+	if !strings.HasPrefix(path, "/") {
+		path = "/" + path
+	}
 
-	log.Printf("server listening on %s (tunnel endpoint: /tunnel)", cfg.Listen)
+	mux := http.NewServeMux()
+	mux.HandleFunc(path, srv.HandleHTTP)
+	if path != "/tunnel" {
+		mux.HandleFunc("/tunnel", srv.HandleHTTP)
+	}
+	// last-resort fallback (some proxies rewrite paths)
+	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		// only accept POST (to avoid looking like a full website)
+		if r.Method != http.MethodPost {
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		srv.HandleHTTP(w, r)
+	})
+
+	log.Printf("server listening on %s (tunnel endpoint: %s)", cfg.Listen, path)
 	log.Fatal(http.ListenAndServe(cfg.Listen, mux))
 }
 
