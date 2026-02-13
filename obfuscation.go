@@ -15,6 +15,18 @@ type ObfsConfig struct {
 	BurstChance int  `yaml:"burst_chance"`
 }
 
+// Decoy strings to inject into the padding to mimic Dagger's traffic patterns
+var decoyPatterns = []string{
+	"User-Agent: ",
+	"GET / HTTP/1.1",
+	"POST / HTTP/1.1",
+	"Host: ",
+	"Accept: */*",
+	"Content-Type: application/octet-stream",
+	"Connection: keep-alive",
+	"Cache-Control: no-cache",
+}
+
 // Wire: [2 bytes padLen][data][padding]
 func ApplyObfuscation(data []byte, cfg *ObfsConfig) []byte {
 	if cfg == nil || !cfg.Enabled {
@@ -34,7 +46,20 @@ func ApplyObfuscation(data []byte, cfg *ObfsConfig) []byte {
 	copy(out[2:], data)
 
 	if pad > 0 {
-		_, _ = rand.Read(out[2+len(data):])
+		paddingArea := out[2+len(data):]
+		_, _ = rand.Read(paddingArea)
+
+		// Dagger-Mimic: Inject a decoy string if padding is large enough
+		if pad > 12 {
+			decoyIdx := int(randByte()) % len(decoyPatterns)
+			decoyStr := decoyPatterns[decoyIdx]
+
+			if len(decoyStr) < pad {
+				maxOffset := pad - len(decoyStr)
+				offset := int(randByte()) % (maxOffset + 1)
+				copy(paddingArea[offset:], []byte(decoyStr))
+			}
+		}
 	}
 	return out
 }
