@@ -156,6 +156,9 @@ func (hc *HTTPConn) RoundTrip(payload []byte) ([]byte, error) {
 		for _, c := range resp.Cookies() {
 <<<<<<< HEAD
 <<<<<<< HEAD
+<<<<<<< HEAD
+=======
+>>>>>>> eac5513 (New Update)
 =======
 >>>>>>> eac5513 (New Update)
 			if c == nil || c.Value == "" {
@@ -169,12 +172,15 @@ func (hc *HTTPConn) RoundTrip(payload []byte) ([]byte, error) {
 			}
 			if c.Name == hc.CookieName {
 <<<<<<< HEAD
+<<<<<<< HEAD
 =======
 			if c == nil {
 				continue
 			}
 			if c.Name == "session" && c.Value != "" {
 >>>>>>> ce9c9960a462af1d2b04906222b2d63c6bdd40fd
+=======
+>>>>>>> eac5513 (New Update)
 =======
 >>>>>>> eac5513 (New Update)
 				hc.SessionID = c.Value
