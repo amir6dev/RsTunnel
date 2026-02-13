@@ -14,6 +14,8 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: Setup Go
         uses: actions/setup-go@v5
@@ -21,40 +23,48 @@ jobs:
           go-version: "1.22.1"
           cache: true
 
-      - name: Download deps
+      - name: Tidy & Download deps
         run: |
           go env
+          go mod tidy
           go mod download
+          ls -la go.mod go.sum
 
       - name: Build linux amd64
         run: |
+          VERSION="${GITHUB_REF_NAME}"
           mkdir -p dist
           CGO_ENABLED=0 GOOS=linux GOARCH=amd64 \
-            go build -trimpath -ldflags="-s -w" -o dist/picotun ./cmd/picotun
+            go build -trimpath -ldflags="-s -w -X main.version=${VERSION}" -o dist/picotun ./cmd/picotun
           file dist/picotun
-          tar -czf dist/picotun_linux_amd64.tar.gz -C dist picotun
-          sha256sum dist/picotun_linux_amd64.tar.gz > dist/picotun_linux_amd64.sha256
+          tar -czf "dist/picotun-${VERSION}-linux-amd64.tar.gz" -C dist picotun
+          sha256sum "dist/picotun-${VERSION}-linux-amd64.tar.gz" > "dist/picotun-${VERSION}-linux-amd64.sha256"
 
       - name: Build linux arm64
         run: |
+          VERSION="${GITHUB_REF_NAME}"
           mkdir -p dist2
           CGO_ENABLED=0 GOOS=linux GOARCH=arm64 \
-            go build -trimpath -ldflags="-s -w" -o dist2/picotun ./cmd/picotun
+            go build -trimpath -ldflags="-s -w -X main.version=${VERSION}" -o dist2/picotun ./cmd/picotun
           file dist2/picotun
-          tar -czf dist/picotun_linux_arm64.tar.gz -C dist2 picotun
-          sha256sum dist/picotun_linux_arm64.tar.gz > dist/picotun_linux_arm64.sha256
+          tar -czf "dist/picotun-${VERSION}-linux-arm64.tar.gz" -C dist2 picotun
+          sha256sum "dist/picotun-${VERSION}-linux-arm64.tar.gz" > "dist/picotun-${VERSION}-linux-arm64.sha256"
 
       - name: Checksums
         run: |
-          sha256sum dist/picotun_linux_amd64.tar.gz dist/picotun_linux_arm64.tar.gz > dist/checksums.txt
+          VERSION="${GITHUB_REF_NAME}"
+          sha256sum \
+            "dist/picotun-${VERSION}-linux-amd64.tar.gz" \
+            "dist/picotun-${VERSION}-linux-arm64.tar.gz" \
+            > "dist/checksums-${VERSION}.txt"
 
       - name: Release
         uses: softprops/action-gh-release@v2
         with:
           files: |
-            dist/picotun_linux_amd64.tar.gz
-            dist/picotun_linux_amd64.sha256
-            dist/picotun_linux_arm64.tar.gz
-            dist/picotun_linux_arm64.sha256
-            dist/checksums.txt
+            dist/picotun-*-linux-amd64.tar.gz
+            dist/picotun-*-linux-amd64.sha256
+            dist/picotun-*-linux-arm64.tar.gz
+            dist/picotun-*-linux-arm64.sha256
+            dist/checksums-*.txt
           generate_release_notes: true
