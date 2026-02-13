@@ -11,7 +11,9 @@ type MimicConfig struct {
 	UserAgent     string   `yaml:"user_agent"`
 	CustomHeaders []string `yaml:"custom_headers"`
 	SessionCookie bool     `yaml:"session_cookie"`
-	Chunked       bool     `yaml:"chunked"`
+	// Chunked controls whether the client uses Transfer-Encoding: chunked.
+	// Dagger's config key is "chunked_encoding"; config.go maps that to this field.
+	Chunked bool `yaml:"chunked"`
 }
 
 func ApplyMimicHeaders(req *http.Request, cfg *MimicConfig, sessionID string) {
@@ -25,7 +27,7 @@ func ApplyMimicHeaders(req *http.Request, cfg *MimicConfig, sessionID string) {
 	if cfg == nil {
 		req.Header.Set("User-Agent", "Mozilla/5.0")
 		if sessionID != "" {
-			req.Header.Set("Cookie", "SESSION="+sessionID)
+			req.Header.Set("Cookie", "session="+sessionID)
 		}
 		return
 	}
@@ -34,6 +36,17 @@ func ApplyMimicHeaders(req *http.Request, cfg *MimicConfig, sessionID string) {
 		req.Header.Set("User-Agent", cfg.UserAgent)
 	} else {
 		req.Header.Set("User-Agent", "Mozilla/5.0")
+	}
+
+	// Dagger-style mimic: Host spoof + path request are handled elsewhere.
+	// Here we only ensure headers look browser-like.
+	// If no custom headers provided, apply a Dagger-like minimal set.
+	if len(cfg.CustomHeaders) == 0 {
+		req.Header.Set("X-Requested-With", "XMLHttpRequest")
+		if cfg.FakeDomain != "" {
+			refer := "https://" + cfg.FakeDomain + "/"
+			req.Header.Set("Referer", refer)
+		}
 	}
 
 	// Custom headers "Key: Value"
@@ -50,6 +63,7 @@ func ApplyMimicHeaders(req *http.Request, cfg *MimicConfig, sessionID string) {
 	}
 
 	if cfg.SessionCookie && sessionID != "" {
-		req.Header.Set("Cookie", "SESSION="+sessionID)
+		// Dagger uses cookie name "session" (lowercase) in its decoy responses.
+		req.Header.Set("Cookie", "session="+sessionID)
 	}
 }

@@ -2,6 +2,7 @@ package httpmux
 
 import (
 	"bytes"
+	"encoding/hex"
 	"io"
 	"net/http"
 	"sync"
@@ -40,29 +41,47 @@ func (s *Server) getActiveSession() *Session {
 }
 
 func (s *Server) HandleHTTP(w http.ResponseWriter, r *http.Request) {
-	// 1. Session Handling
+	// Dagger-like guard: if a fake_path is configured, only accept requests to that path
+	// as tunnel traffic. Everything else returns a decoy HTTP 200 with empty body.
+	if s.Mimic != nil && s.Mimic.FakePath != "" && r.URL.Path != s.Mimic.FakePath {
+		s.writeDecoyHTTP200(w, r)
+		return
+	}
+
+	// 1) Session Handling (Dagger uses cookie name "session")
 	sessionID := extractSessionID(r)
-	if _, err := r.Cookie("SESSION"); err != nil {
-		http.SetCookie(w, &http.Cookie{Name: "SESSION", Value: sessionID, Path: "/"})
+	if s.Mimic != nil && s.Mimic.SessionCookie {
+		if _, err := r.Cookie("session"); err != nil {
+			http.SetCookie(w, &http.Cookie{Name: "session", Value: sessionID, Path: "/", HttpOnly: true, SameSite: http.SameSiteLaxMode})
+		}
 	}
 	sess := s.SessionMgr.GetOrCreate(sessionID)
 	s.setActiveSession(sess)
 
-	// 2. Read Request (Inbound Data)
+	// 2) Read Request (Inbound Data)
 	reqBody, _ := io.ReadAll(r.Body)
 	_ = r.Body.Close()
 
-	if len(reqBody) > 0 {
-		reqBody = StripObfuscation(reqBody, s.Obfs)
-		plain, err := DecryptPSK(reqBody, s.PSK)
-		if err == nil {
-			reader := bytes.NewReader(plain)
-			for {
-				fr, err := ReadFrame(reader)
-				if err != nil { break }
-				s.handleFrame(sess, fr)
-			}
+	// If body is empty or decrypt fails, behave like Dagger: decoy 200 with empty body.
+	// This is important for users probing with curl/wget or scanners.
+	if len(reqBody) == 0 {
+		s.writeDecoyHTTP200(w, r)
+		return
+	}
+
+	reqBody = StripObfuscation(reqBody, s.Obfs)
+	plain, err := DecryptPSK(reqBody, s.PSK)
+	if err != nil {
+		s.writeDecoyHTTP200(w, r)
+		return
+	}
+	reader := bytes.NewReader(plain)
+	for {
+		fr, err := ReadFrame(reader)
+		if err != nil {
+			break
 		}
+		s.handleFrame(sess, fr)
 	}
 
 	// 3. Long-Polling Logic (Outbound Data)
@@ -90,14 +109,13 @@ func (s *Server) HandleHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	// 4. Encrypt & Send Response
-	// حتی اگر out خالی باشد، باید پاسخ رمزنگاری شده (شامل Padding) برود
+	// 4) Encrypt & Send Response
 	enc, _ := EncryptPSK(out.Bytes(), s.PSK)
 	resp := ApplyObfuscation(enc, s.Obfs)
 	ApplyDelay(s.Obfs)
-	
+
 	w.Header().Set("Content-Type", "application/octet-stream")
-	w.Write(resp)
+	_, _ = w.Write(resp)
 }
 
 func (s *Server) handleFrame(sess *Session, fr *Frame) {
@@ -147,6 +165,37 @@ func (s *Server) handleFrame(sess *Session, fr *Frame) {
 }
 
 func extractSessionID(r *http.Request) string {
-	if c, _ := r.Cookie("SESSION"); c != nil && c.Value != "" { return c.Value }
+	if c, _ := r.Cookie("session"); c != nil && c.Value != "" {
+		return c.Value
+	}
+	// Dagger's session cookie looks like 32 hex chars. We'll generate the same shape.
+	b := []byte(RandString(32))
+	// RandString returns base62-ish; convert to hex-looking bytes deterministically.
+	// This isn't cryptographic; it's only to blend in.
+	enc := make([]byte, hex.EncodedLen(len(b)))
+	hex.Encode(enc, b)
+	if len(enc) >= 32 {
+		return string(enc[:32])
+	}
 	return "sess-" + RandString(12)
+}
+
+// writeDecoyHTTP200 mimics the visible behavior of Dagger's httpmux when a request
+// doesn't look like tunnel traffic (e.g., curl). It returns 200 OK with empty body
+// and sets a "session" cookie.
+func (s *Server) writeDecoyHTTP200(w http.ResponseWriter, r *http.Request) {
+	// A few nginx-like headers commonly observed.
+	w.Header().Set("Server", "nginx/1.18.0")
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	w.Header().Set("Cache-Control", "private, max-age=0")
+	w.Header().Set("X-Frame-Options", "SAMEORIGIN")
+	w.Header().Set("X-Content-Type-Options", "nosniff")
+
+	if s.Mimic != nil && s.Mimic.SessionCookie {
+		if _, err := r.Cookie("session"); err != nil {
+			http.SetCookie(w, &http.Cookie{Name: "session", Value: extractSessionID(r), Path: "/", HttpOnly: true, SameSite: http.SameSiteLaxMode})
+		}
+	}
+
+	w.WriteHeader(http.StatusOK)
 }

@@ -21,16 +21,16 @@ jobs:
           go-version: "1.22.1"
           cache: true
 
-      - name: Download deps
+      # Ensure module mode can write go.sum during CI even if it's missing in the repo.
+      - name: Prepare modules (generate go.sum)
         run: |
           go env
-          go mod download
+          GOFLAGS="-mod=mod" go mod tidy
 
       - name: Build linux amd64
         run: |
           mkdir -p dist
-          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 \
-            go build -trimpath -ldflags="-s -w" -o dist/picotun ./cmd/picotun
+          CGO_ENABLED=0 GOOS=linux GOARCH=amd64             go build -trimpath -ldflags="-s -w" -o dist/picotun ./cmd/picotun
           file dist/picotun
           tar -czf dist/picotun_linux_amd64.tar.gz -C dist picotun
           sha256sum dist/picotun_linux_amd64.tar.gz > dist/picotun_linux_amd64.sha256
@@ -38,8 +38,7 @@ jobs:
       - name: Build linux arm64
         run: |
           mkdir -p dist2
-          CGO_ENABLED=0 GOOS=linux GOARCH=arm64 \
-            go build -trimpath -ldflags="-s -w" -o dist2/picotun ./cmd/picotun
+          CGO_ENABLED=0 GOOS=linux GOARCH=arm64             go build -trimpath -ldflags="-s -w" -o dist2/picotun ./cmd/picotun
           file dist2/picotun
           tar -czf dist/picotun_linux_arm64.tar.gz -C dist2 picotun
           sha256sum dist/picotun_linux_arm64.tar.gz > dist/picotun_linux_arm64.sha256
