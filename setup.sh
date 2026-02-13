@@ -235,18 +235,22 @@ install_core_from_release() {
     return 1
   fi
 
-  # Detect obvious HTML/text (blocked/proxy pages)
-  if head -c 256 "$tmp" 2>/dev/null | grep -Eqi "<!doctype html|<html|access denied|forbidden|cloudflare"; then
-    echo "! Downloaded content looks like an HTML block/proxy page."
+    # Detect obvious HTML/text (blocked/proxy pages)
+  if head -c 256 "$tgz" 2>/dev/null | grep -Eqi "<!doctype html|<html|access denied|forbidden|cloudflare"; then
+    warn "Downloaded content looks like an HTML block/proxy page."
+    rm -rf "$tmpd" || true
     return 1
   fi
 
   # Verify gzip magic bytes (1f 8b) for tar.gz assets
-  magic="$(head -c 2 "$tmp" 2>/dev/null | od -An -tx1 | tr -d ' \n')"
+  local magic
+  magic="$(head -c 2 "$tgz" 2>/dev/null | od -An -tx1 | tr -d ' \n')"
   if [[ "$magic" != "1f8b" ]]; then
-    echo "! Downloaded content is not a gzip archive (unexpected magic: $magic)."
+    warn "Downloaded content is not a gzip archive (unexpected magic: ${magic})."
+    rm -rf "$tmpd" || true
     return 1
   fi
+
 
   if ! file "$tgz" | grep -qiE "gzip compressed data"; then
     warn "Downloaded file is not a gzip archive."
