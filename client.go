@@ -16,13 +16,8 @@ type Client struct {
 	Transport *HTTPMuxTransport
 }
 
-// NewClientFromPaths creates a client based on one or more Dagger-like path configs.
-// It builds a shared mux transport over ALL paths (multi-path), so if one path is blocked,
-// others can keep the tunnel alive.
-//
-// - connection_pool is applied per-path
-// - retry_interval / aggressive_pool affect per-connection cooldown after failures
-func NewClientFromPaths(paths []PathConfig, sessionID string, mimic *MimicConfig, obfs *ObfsConfig, psk string) *Client {
+// FIXED: Added cfg parameter to pass through Dagger-like features
+func NewClientFromPaths(paths []PathConfig, sessionID string, mimic *MimicConfig, obfs *ObfsConfig, psk string, cfg HTTPMuxConfig) *Client {
 	if mimic == nil {
 		mimic = &MimicConfig{}
 	}
@@ -31,7 +26,6 @@ func NewClientFromPaths(paths []PathConfig, sessionID string, mimic *MimicConfig
 	}
 
 	if len(paths) == 0 {
-		// safe fallback: create a single default path from mimic config (mostly for legacy server_url users)
 		paths = []PathConfig{{Transport: "httpmux", Addr: "", ConnectionPool: 2, RetryInterval: 3, DialTimeout: 10}}
 	}
 
@@ -44,7 +38,6 @@ func NewClientFromPaths(paths []PathConfig, sessionID string, mimic *MimicConfig
 			continue
 		}
 
-		// Dagger defaults
 		pool := path.ConnectionPool
 		if pool <= 0 {
 			pool = 2
@@ -63,13 +56,12 @@ func NewClientFromPaths(paths []PathConfig, sessionID string, mimic *MimicConfig
 		for i := 0; i < pool; i++ {
 			var tr *http.Transport
 
-			// httpmux: plain HTTP mimicry (no TLS)
 			if transport == "httpmux" || transport == "wsmux" || transport == "tcpmux" || transport == "" {
 				dialer := &net.Dialer{Timeout: dialTimeout, KeepAlive: 30 * time.Second}
 				tr = &http.Transport{
 					DialContext:           dialer.DialContext,
 					DisableCompression:    false,
-					ForceAttemptHTTP2:     false, // keep it HTTP/1.1-like
+					ForceAttemptHTTP2:     false,
 					MaxIdleConns:          1024,
 					MaxIdleConnsPerHost:   256,
 					IdleConnTimeout:       90 * time.Second,
@@ -77,7 +69,6 @@ func NewClientFromPaths(paths []PathConfig, sessionID string, mimic *MimicConfig
 					ExpectContinueTimeout: 1 * time.Second,
 				}
 			} else {
-				// httpsmux / wssmux: TLS mimicry (uTLS) + HTTP/2
 				tr = &http.Transport{
 					DialTLSContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
 						rawConn, err := net.DialTimeout(network, addr, dialTimeout)
@@ -93,7 +84,7 @@ func NewClientFromPaths(paths []PathConfig, sessionID string, mimic *MimicConfig
 
 						uConn := utls.UClient(rawConn, &utls.Config{
 							ServerName:         serverName,
-							InsecureSkipVerify: true, // allow self-signed
+							InsecureSkipVerify: true,
 						}, utls.HelloChrome_120)
 
 						if err := uConn.Handshake(); err != nil {
@@ -112,30 +103,37 @@ func NewClientFromPaths(paths []PathConfig, sessionID string, mimic *MimicConfig
 					Transport: tr,
 					Timeout:   25 * time.Second,
 				},
-				Mimic:         mimic,
-				Obfs:          obfs,
-				PSK:           psk,
-				SessionID:     sessionID,
-				ServerURL:     serverURL,
-				RetryInterval: retryInterval,
-				Aggressive:    path.AggressivePool,
+				Mimic:            mimic,
+				Obfs:             obfs,
+				PSK:              psk,
+				SessionID:        sessionID,
+				ServerURL:        serverURL,
+				RetryInterval:    retryInterval,
+				Aggressive:       path.AggressivePool,
+				EmbedFakeHeaders: cfg.EmbedFakeHeaders, // ✅ FIXED: Now actually set!
 			})
 		}
 	}
 
-	mt := NewHTTPMuxTransport(conns, HTTPMuxConfig{
-		FlushInterval: 200 * time.Millisecond,
-		MaxBatch:      64,
-		IdlePoll:      250 * time.Millisecond,
-	})
-
+	// ✅ FIXED: Pass full cfg instead of just hardcoded values
+	mt := NewHTTPMuxTransport(conns, cfg)
 	_ = mt.Start()
 	return &Client{Transport: mt}
 }
 
-// NewClientFromPath keeps compatibility with older code; it uses a single path.
+// FIXED: Added cfg parameter (backward compatibility wrapper)
 func NewClientFromPath(path PathConfig, sessionID string, mimic *MimicConfig, obfs *ObfsConfig, psk string) *Client {
-	return NewClientFromPaths([]PathConfig{path}, sessionID, mimic, obfs, psk)
+	// Use default config for backward compatibility
+	cfg := HTTPMuxConfig{
+		FlushInterval:    200 * time.Millisecond,
+		MaxBatch:         64,
+		IdlePoll:         250 * time.Millisecond,
+		NumConnections:   4,
+		EnableDecoy:      true,
+		DecoyInterval:    5 * time.Second,
+		EmbedFakeHeaders: true,
+	}
+	return NewClientFromPaths([]PathConfig{path}, sessionID, mimic, obfs, psk, cfg)
 }
 
 func buildServerURL(transport, addr string, mimic *MimicConfig) string {
@@ -144,7 +142,6 @@ func buildServerURL(transport, addr string, mimic *MimicConfig) string {
 		return ""
 	}
 
-	// addr may be "1.2.3.4:2020" (Dagger-style) or a full URL.
 	if strings.Contains(addr, "://") {
 		return normalizeServerURL(addr, mimic)
 	}
@@ -157,8 +154,6 @@ func buildServerURL(transport, addr string, mimic *MimicConfig) string {
 	return normalizeServerURL(scheme+"://"+addr, mimic)
 }
 
-// normalizeServerURL ensures URL has a path (Dagger-style).
-// If user passes only "http(s)://host:port" we append mimic.fake_path (default: /tunnel).
 func normalizeServerURL(raw string, mimic *MimicConfig) string {
 	raw = strings.TrimSpace(raw)
 	if raw == "" {
