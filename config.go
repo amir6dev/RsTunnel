@@ -19,6 +19,12 @@ type Config struct {
 	MaxSessions int    `yaml:"max_sessions"`
 	Heartbeat   int    `yaml:"heartbeat"`
 
+	// ✅ NEW: Dagger-like features
+	NumConnections   int  `yaml:"num_connections"`
+	EnableDecoy      bool `yaml:"enable_decoy"`
+	DecoyInterval    int  `yaml:"decoy_interval"` // seconds
+	EmbedFakeHeaders bool `yaml:"embed_fake_headers"`
+
 	Maps  []DaggerMap  `yaml:"maps"`
 	Paths []PathConfig `yaml:"paths"`
 
@@ -177,6 +183,21 @@ func applyBaseDefaults(c *Config) {
 	}
 	if !c.Obfuscation.Enabled {
 		c.Obfuscation.Enabled = true
+	}
+
+	// ✅ NEW: Dagger-like feature defaults
+	if c.NumConnections <= 0 {
+		c.NumConnections = 4 // Like Dagger
+	}
+	if c.DecoyInterval <= 0 {
+		c.DecoyInterval = 5 // 5 seconds
+	}
+	// Default to enabling these features
+	if !c.EnableDecoy {
+		c.EnableDecoy = true
+	}
+	if !c.EmbedFakeHeaders {
+		c.EmbedFakeHeaders = true
 	}
 }
 
