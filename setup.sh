@@ -3,7 +3,7 @@ set -euo pipefail
 
 # ============================================================
 # RsTunnel (picotun) Installer - Dagger-like UX (Iran-safe)
-# - NO GitHub API
+# - NO GitHub API (uses releases/latest redirect)
 # - NO Python JSON parsing
 # - Installs Release binary (no Go required)
 # - Idempotent deps install (skip if installed)
@@ -24,12 +24,7 @@ VERSION_FILE="${INSTALL_DIR}/.installed_tag"
 SERVICE_SERVER="${BIN_NAME}-server"
 SERVICE_CLIENT="${BIN_NAME}-client"
 
-# Expected release assets:
-#   picotun_linux_amd64.tar.gz
-#   picotun_linux_arm64.tar.gz
-#
-# Each tar.gz should contain a single executable named "picotun".
-
+# Mirror prefixes (Iran-safe)
 DL_PREFIXES=(
   ""
   "https://ghproxy.com/"
@@ -139,61 +134,25 @@ ensure_deps() {
 }
 
 # --------- Download helpers ----------
-is_probably_html() {
-  # check first 512 bytes for common HTML/proxy/challenge pages
-  local f="$1"
-  local head512
-  head512="$(head -c 512 "$f" 2>/dev/null || true)"
-  echo "$head512" | grep -Eqi \
-    "<!doctype html|<html|access denied|forbidden|cloudflare|just a moment|nginx|proxy|blocked|captcha"
-}
-
-is_gzip_file() {
-  local f="$1"
-  local magic
-  magic="$(head -c 2 "$f" 2>/dev/null | od -An -tx1 | tr -d ' \n' || true)"
-  [[ "$magic" == "1f8b" ]] || return 1
-  file "$f" | grep -qiE "gzip compressed data"
-}
-
 download_with_prefixes() {
-  # Only succeeds if we downloaded a REAL gzip file (not HTML).
   local url="$1" out="$2"
   local p full
 
   rm -f "$out" >/dev/null 2>&1 || true
-
   for p in "${DL_PREFIXES[@]}"; do
     full="${p}${url}"
-    rm -f "$out" >/dev/null 2>&1 || true
-
-    # Download
-    if ! curl -fL --retry 3 --retry-connrefused --retry-delay 1 \
-      --connect-timeout 10 --max-time 240 \
+    # -f: fail on HTTP error codes (404, 403, ...)
+    if curl -fL --retry 3 --retry-connrefused --retry-delay 1 --connect-timeout 10 --max-time 240 \
       -A "$USER_AGENT" \
-      -H "Accept: application/octet-stream,*/*;q=0.8" \
+      -H "Accept: */*" \
       -H "Cache-Control: no-cache" \
-      --compressed \
       "$full" -o "$out" >/dev/null 2>&1; then
-      continue
+      if [[ -s "$out" ]]; then
+        return 0
+      fi
     fi
-
-    [[ -s "$out" ]] || continue
-
-    # Reject HTML/proxy pages
-    if is_probably_html "$out"; then
-      continue
-    fi
-
-    # Must be gzip
-    if ! is_gzip_file "$out"; then
-      continue
-    fi
-
-    ok "Download OK via mirror: ${p:-direct}"
-    return 0
+    rm -f "$out" >/dev/null 2>&1 || true
   done
-
   return 1
 }
 
@@ -204,7 +163,10 @@ get_latest_tag_via_redirect() {
 
   for p in "${DL_PREFIXES[@]}"; do
     u="${p}${url}"
-    loc="$(curl -fsSLI --connect-timeout 10 --max-time 30 -A "$USER_AGENT" "$u" 2>/dev/null \
+    loc="$(curl -fsSLI --connect-timeout 10 --max-time 30 \
+      -A "$USER_AGENT" \
+      -H "Accept: text/html" \
+      "$u" 2>/dev/null \
       | awk -F': ' 'tolower($1)=="location"{print $2}' | tail -n 1 | tr -d '\r')"
     if [[ -n "$loc" ]]; then
       echo "$loc" | awk -F'/tag/' '{print $2}' | tr -d '\r'
@@ -238,10 +200,26 @@ verify_elf_arch() {
   fi
 }
 
+is_html_or_block_page() {
+  local f="$1"
+  # check first ~1KB for typical block/html markers
+  head -c 1024 "$f" 2>/dev/null | tr -d '\000' | grep -Eqi \
+    "<!doctype html|<html|access denied|forbidden|cloudflare|attention required|not found|404|nginx|proxy" \
+    && return 0
+  return 1
+}
+
+is_gzip_file() {
+  local f="$1"
+  local magic
+  magic="$(head -c 2 "$f" 2>/dev/null | od -An -tx1 | tr -d ' \n')"
+  [[ "$magic" == "1f8b" ]]
+}
+
 install_core_from_release() {
   ensure_deps
 
-  local arch tag url installed tmpd tgz
+  local arch tag installed tmpd tgz base_url fname url tried
   arch="$(detect_arch)"
   log "⬇️  Installing core for arch: ${arch}"
 
@@ -252,48 +230,74 @@ install_core_from_release() {
     return 1
   fi
 
-  url="https://github.com/${REPO_OWNER}/${REPO_NAME}/releases/download/${tag}/${BIN_NAME}_linux_${arch}.tar.gz"
-
   installed="$(read_installed_tag)"
   if [[ -n "$installed" && "$installed" == "$tag" && -x "$BIN_PATH" ]]; then
     ok "Core already up-to-date (${tag})"
     return 0
   fi
 
+  # IMPORTANT:
+  # release.yml produces:
+  #   picotun-${VERSION}-linux-amd64.tar.gz   where VERSION = tag like v1.8.5
+  base_url="https://github.com/${REPO_OWNER}/${REPO_NAME}/releases/download/${tag}"
+
+  # Try multiple possible asset naming schemes (new -> old)
+  local candidates=(
+    "${BIN_NAME}-${tag}-linux-${arch}.tar.gz"   # ✅ matches your workflow
+    "${BIN_NAME}_${tag}_linux_${arch}.tar.gz"  # fallback
+    "${BIN_NAME}_linux_${arch}.tar.gz"         # legacy fallback
+  )
+
   tmpd="$(mktemp -d "/tmp/${BIN_NAME}-dl.XXXXXX")"
   tgz="${tmpd}/${BIN_NAME}.tar.gz"
 
-  if ! download_with_prefixes "$url" "$tgz"; then
-    warn "Downloaded content looks like an HTML block/proxy page OR not a valid gzip."
-    err "Core update failed. Try another mirror prefix or use a proxy/VPN."
-    err "URL: $url"
-    rm -rf "$tmpd" || true
-    return 1
-  fi
+  tried=""
+  for fname in "${candidates[@]}"; do
+    url="${base_url}/${fname}"
+    tried+=$'\n  - '"$url"
+    if download_with_prefixes "$url" "$tgz"; then
+      # validate content is not html and is gzip
+      if is_html_or_block_page "$tgz"; then
+        warn "Downloaded content looks like an HTML block/proxy page OR 404 HTML."
+        rm -f "$tgz" >/dev/null 2>&1 || true
+        continue
+      fi
+      if ! is_gzip_file "$tgz"; then
+        warn "Downloaded content is not a valid gzip (bad magic)."
+        rm -f "$tgz" >/dev/null 2>&1 || true
+        continue
+      fi
+      if ! file "$tgz" | grep -qiE "gzip compressed data"; then
+        warn "Downloaded file is not reported as gzip by 'file'."
+        rm -f "$tgz" >/dev/null 2>&1 || true
+        continue
+      fi
 
-  # Extract & validate
-  if ! tar -xzf "$tgz" -C "$tmpd" >/dev/null 2>&1; then
-    err "Failed to extract downloaded archive."
-    rm -rf "$tmpd" || true
-    return 1
-  fi
+      # extract + check expected binary
+      tar -xzf "$tgz" -C "$tmpd"
+      if [[ ! -f "${tmpd}/${BIN_NAME}" ]]; then
+        warn "Archive doesn't contain '${BIN_NAME}'."
+        rm -rf "$tmpd" || true
+        err "Core update failed."
+        return 1
+      fi
 
-  if [[ ! -f "${tmpd}/${BIN_NAME}" ]]; then
-    err "Archive doesn't contain ${BIN_NAME}"
-    err "Make sure release asset contains a file named '${BIN_NAME}'"
-    rm -rf "$tmpd" || true
-    return 1
-  fi
+      chmod +x "${tmpd}/${BIN_NAME}"
+      verify_elf_arch "${tmpd}/${BIN_NAME}" "$arch" || { rm -rf "$tmpd" || true; return 1; }
 
-  chmod +x "${tmpd}/${BIN_NAME}"
-  verify_elf_arch "${tmpd}/${BIN_NAME}" "$arch" || { rm -rf "$tmpd" || true; return 1; }
+      install -m 0755 "${tmpd}/${BIN_NAME}" "$BIN_PATH"
+      rm -rf "$tmpd" || true
 
-  install -m 0755 "${tmpd}/${BIN_NAME}" "$BIN_PATH"
+      write_installed_tag "$tag"
+      ok "Core installed: ${BIN_PATH} (${tag})"
+      return 0
+    fi
+  done
+
   rm -rf "$tmpd" || true
-
-  write_installed_tag "$tag"
-  ok "Core installed: ${BIN_PATH} (${tag})"
-  return 0
+  err "Core update failed. Try another mirror prefix or use a proxy/VPN."
+  err "Tried URLs:${tried}"
+  return 1
 }
 
 # --------- User-Agent helper ----------
@@ -388,7 +392,7 @@ health_check_server() {
   local fake_path="/tunnel"
   if [[ -f "$cfg" ]]; then
     local fp
-    fp="$(grep -E '^[[:space:]]*fake_path:' "$cfg" 2>/dev/null | head -n1 | awk -F: '{print $2}' | tr -d ' "\r' || true)"
+    fp="$(grep -E '^\s*fake_path:' "$cfg" 2>/dev/null | head -n1 | awk -F: '{print $2}' | tr -d ' "\r' || true)"
     if [[ -n "$fp" ]]; then
       [[ "$fp" == /* ]] || fp="/$fp"
       fake_path="$fp"
