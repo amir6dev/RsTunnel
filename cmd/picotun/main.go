@@ -78,12 +78,66 @@ func runClient(cfg *httpmux.Config) {
 		if strings.TrimSpace(cfg.ServerURL) == "" {
 			log.Fatal("client requires either 'paths:' or 'server_url:'")
 		}
-		paths = append(paths, httpmux.PathConfig{Transport: "httpmux", Addr: cfg.ServerURL, ConnectionPool: 2, AggressivePool: true, RetryInterval: 3, DialTimeout: 10})
+		paths = append(paths, httpmux.PathConfig{
+			Transport:      "httpmux",
+			Addr:           cfg.ServerURL,
+			ConnectionPool: 2,
+			AggressivePool: true,
+			RetryInterval:  3,
+			DialTimeout:    10,
+		})
 	}
-	cl := httpmux.NewClientFromPaths(paths, cfg.SessionID, &cfg.Mimic, &cfg.Obfs, cfg.PSK)
+
+	// ✅ FIXED: Create proper HTTPMuxConfig with all Dagger-like features
+	muxCfg := httpmux.HTTPMuxConfig{
+		FlushInterval:    200 * time.Millisecond,
+		MaxBatch:         64,
+		IdlePoll:         250 * time.Millisecond,
+		NumConnections:   cfg.NumConnections,
+		EnableDecoy:      cfg.EnableDecoy,
+		DecoyInterval:    time.Duration(cfg.DecoyInterval) * time.Second,
+		EmbedFakeHeaders: cfg.EmbedFakeHeaders,
+	}
+
+	// ✅ FIXED: Pass muxCfg to NewClientFromPaths
+	cl := httpmux.NewClientFromPaths(paths, cfg.SessionID, &cfg.Mimic, &cfg.Obfs, cfg.PSK, muxCfg)
 	rev := httpmux.NewClientReverse(cl.Transport)
 	go rev.Run()
-	log.Printf("client started. paths=%d first_transport=%s first_addr=%s session_id=%s", len(paths), paths[0].Transport, paths[0].Addr, cfg.SessionID)
+
+	// ✅ FIXED: Send initial ping to establish connection immediately
+	log.Printf("client started. paths=%d first_transport=%s first_addr=%s session_id=%s",
+		len(paths), paths[0].Transport, paths[0].Addr, cfg.SessionID)
+
+	// Send first ping right away to establish connection
+	_ = cl.Transport.Send(&httpmux.Frame{
+		StreamID: 0,
+		Type:     httpmux.FramePing,
+	})
+
+	// ✅ FIXED: Start heartbeat goroutine to keep connection alive
+	go func() {
+		heartbeatInterval := time.Duration(cfg.Heartbeat) * time.Second
+		if heartbeatInterval <= 0 {
+			heartbeatInterval = 10 * time.Second
+		}
+
+		ticker := time.NewTicker(heartbeatInterval)
+		defer ticker.Stop()
+
+		for {
+			<-ticker.C
+			// Send periodic ping to keep connection alive and prevent NAT timeout
+			_ = cl.Transport.Send(&httpmux.Frame{
+				StreamID: 0,
+				Type:     httpmux.FramePing,
+			})
+			if cfg.Verbose {
+				log.Printf("heartbeat ping sent")
+			}
+		}
+	}()
+
+	// Keep main goroutine alive
 	for {
 		time.Sleep(60 * time.Second)
 	}
